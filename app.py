@@ -370,30 +370,75 @@ st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 st.subheader("Top Rebounders")
 top_n = st.slider("Show top N", 10, 100, 25, key="topn")
 
-def highlight_row(row):
-    if row["Recovery of Fall %"] >= 75:
-        return ["background-color: #d1fae5"] * len(row)
-    elif row["Recovery of Fall %"] < 30:
-        return ["background-color: #fef3c7"] * len(row)
-    return [""] * len(row)
+def style_row(row):
+    """Color the Recovery cell only — keeps the rest of the row clean and readable."""
+    styles = [""] * len(row)
+    rec_idx = row.index.get_loc("Recovery of Fall %")
+    rebound_idx = row.index.get_loc("Rebound %")
+    fall_idx = row.index.get_loc("Fall %")
+
+    rec = row["Recovery of Fall %"]
+    if rec >= 75:
+        styles[rec_idx] = "background-color: #166534; color: #ffffff; font-weight: 600;"
+    elif rec >= 50:
+        styles[rec_idx] = "background-color: #65a30d; color: #ffffff; font-weight: 600;"
+    elif rec >= 30:
+        styles[rec_idx] = "background-color: #ca8a04; color: #ffffff; font-weight: 600;"
+    else:
+        styles[rec_idx] = "background-color: #b91c1c; color: #ffffff; font-weight: 600;"
+
+    # Color the Rebound % green (it's always positive in this table)
+    styles[rebound_idx] = "color: #047857; font-weight: 600;"
+    # Color the Fall % red (it's always negative)
+    styles[fall_idx] = "color: #b91c1c; font-weight: 600;"
+    return styles
 
 display_df = ranking_filtered.head(top_n)
-st.dataframe(
-    display_df.style.apply(highlight_row, axis=1).format({
+styled = (
+    display_df.style
+    .apply(style_row, axis=1)
+    .format({
         "Peak ₹": "{:,.2f}",
         "Low ₹": "{:,.2f}",
         "Latest ₹": "{:,.2f}",
         "Fall %": "{:+.2f}",
         "Rebound %": "{:+.2f}",
         "Recovery of Fall %": "{:.1f}",
-    }),
-    use_container_width=True,
-    height=600,
+    })
+    .set_properties(**{
+        "color": "#111827",
+        "background-color": "#ffffff",
+        "font-family": "JetBrains Mono, monospace",
+        "font-size": "0.85rem",
+    })
+    .set_table_styles([
+        {"selector": "thead th", "props": [
+            ("background-color", "#0f172a"),
+            ("color", "#ffffff"),
+            ("font-weight", "600"),
+            ("text-transform", "uppercase"),
+            ("letter-spacing", "0.05em"),
+            ("font-size", "0.7rem"),
+            ("padding", "10px 8px"),
+        ]},
+        {"selector": "tbody td", "props": [
+            ("padding", "8px"),
+            ("border-bottom", "1px solid #e5e7eb"),
+        ]},
+        {"selector": "tbody tr:hover", "props": [
+            ("background-color", "#f9fafb"),
+        ]},
+    ])
 )
 
+st.dataframe(styled, use_container_width=True, height=600)
+
 st.caption(
-    "🟢 Green rows: recovery of fall ≥ 75% (strong recovery). "
-    "🟡 Yellow rows: < 30% of fall recovered (weak bounce — possible dead-cat)."
+    "**Recovery of Fall %** color key: "
+    "🟩 ≥75% (strong recovery)  ·  "
+    "🟨 50–75% (solid bounce)  ·  "
+    "🟧 30–50% (partial)  ·  "
+    "🟥 <30% (weak — possible dead-cat bounce)"
 )
 
 # ----- Drill-down chart -----
@@ -443,4 +488,4 @@ st.download_button(
 st.caption(
     "Data via Yahoo Finance (yfinance). Not investment advice. "
     "Analyze at your own discretion."
-)    
+)
