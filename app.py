@@ -221,13 +221,23 @@ def compute_rebound_table(closes: dict, min_days: int) -> pd.DataFrame:
         pre_low = s.loc[:low_date]
         peak_before_low = pre_low.max()
         peak_date = pre_low.idxmax()
+
+        # Skip stocks where there was no real fall before the low
+        # (low == peak means the stock never actually dropped before bottoming —
+        # often happens with new listings or stocks in a steady uptrend).
+        fall_amount = peak_before_low - low_price
+        if fall_amount <= 0 or peak_before_low <= 0:
+            continue
+
         fall_pct = (low_price - peak_before_low) / peak_before_low * 100
         rebound_pct = (latest_price - low_price) / low_price * 100
-        recovery_of_fall = (
-            (latest_price - low_price) / (peak_before_low - low_price) * 100
-            if peak_before_low > low_price
-            else 0.0
-        )
+
+        # Recovery of Fall: what fraction of the drawdown is reclaimed.
+        # Cap at 100% — anything above means the stock is at NEW HIGHS, which
+        # is no longer "recovery" but breakout territory. We flag those separately.
+        raw_recovery = (latest_price - low_price) / fall_amount * 100
+        broke_past_peak = latest_price > peak_before_low
+        recovery_of_fall = min(raw_recovery, 100.0)
 
         rows.append({
             "Symbol": ticker.replace(".NS", ""),
@@ -239,6 +249,7 @@ def compute_rebound_table(closes: dict, min_days: int) -> pd.DataFrame:
             "Fall %": round(fall_pct, 2),
             "Rebound %": round(rebound_pct, 2),
             "Recovery of Fall %": round(recovery_of_fall, 2),
+            "New Highs?": "✅" if broke_past_peak else "",
             "Days Since Low": days_since_low,
         })
     return pd.DataFrame(rows)
@@ -490,30 +501,22 @@ with tab1:
     # ----- HERO CARDS for the top 5 exceptional stocks -----
     if len(exceptional) > 0:
         st.markdown("### 🎯 Top 5 Highlights")
-        top5 = exceptional.head(5)
+        top5 = exceptional.head(5).reset_index(drop=True)
 
-        cards_html = '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 1rem 0;">'
-        for _, r in top5.iterrows():
-            cards_html += f"""
-            <div style="
-                border: 2px solid #d97706;
-                background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
-                padding: 1.2rem;
-                border-radius: 4px;
-                position: relative;
-            ">
-                <div style="position: absolute; top: 8px; right: 12px; font-size: 0.7rem; color: #92400e; letter-spacing: 0.1em;">★★★</div>
-                <div style="font-family: 'Fraunces', serif; font-weight: 800; font-size: 1.3rem; color: #111; margin-bottom: 0.3rem;">{r['Symbol']}</div>
-                <div style="font-size: 0.7rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.1em;">Rebound</div>
-                <div style="font-family: 'Fraunces', serif; font-weight: 600; font-size: 1.6rem; color: #047857;">+{r['Rebound %']:.1f}%</div>
-                <div style="margin-top: 0.6rem; font-size: 0.75rem; color: #4b5563;">
-                    Recovered <b>{r['Recovery of Fall %']:.0f}%</b> of fall<br>
-                    Score: <b>{r['Score']:.2f}σ</b> · {r['Days Since Low']}d ago
-                </div>
-            </div>
-            """
-        cards_html += "</div>"
-        st.markdown(cards_html, unsafe_allow_html=True)
+        # Render each card in its own column with its own st.markdown call.
+        # Concatenating all 5 into one giant HTML string causes Streamlit's
+        # sanitizer to bail out and show raw HTML on screen.
+        cols = st.columns(len(top5))
+        for col, (_, r) in zip(cols, top5.iterrows()):
+            new_high_badge = (
+                '<div style="display:inline-block; background:#16a34a; color:white; '
+                'padding:2px 6px; font-size:0.6rem; font-weight:600; border-radius:2px; '
+                'margin-top:4px;">NEW HIGH</div>'
+                if r.get("New Highs?") == "✅" else ""
+            )
+            card = f"""<div style="border: 2px solid #d97706; background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%); padding: 1.2rem; border-radius: 4px; position: relative; min-height: 180px;"><div style="position: absolute; top: 8px; right: 12px; font-size: 0.7rem; color: #92400e; letter-spacing: 0.1em;">★★★</div><div style="font-family: 'Fraunces', serif; font-weight: 800; font-size: 1.3rem; color: #111; margin-bottom: 0.3rem;">{r['Symbol']}</div><div style="font-size: 0.7rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.1em;">Rebound</div><div style="font-family: 'Fraunces', serif; font-weight: 600; font-size: 1.6rem; color: #047857;">+{r['Rebound %']:.1f}%</div><div style="margin-top: 0.6rem; font-size: 0.75rem; color: #4b5563;">Recovered <b>{r['Recovery of Fall %']:.0f}%</b> of fall<br>Score: <b>{r['Score']:.2f}σ</b> · {r['Days Since Low']}d ago</div>{new_high_badge}</div>"""
+            with col:
+                st.markdown(card, unsafe_allow_html=True)
     else:
         st.info(
             "No stocks crossed the *Exceptional* threshold (composite score ≥ 1.5σ) in this scan. "
@@ -553,7 +556,7 @@ with tab1:
 
         star_cols = [
             "Symbol", "Tier", "Score",
-            "Rebound %", "Recovery of Fall %", "Fall %",
+            "Rebound %", "Recovery of Fall %", "New Highs?", "Fall %",
             "Latest ₹", "Low ₹", "Peak ₹",
             "Days Since Low", "Low Date",
         ]
