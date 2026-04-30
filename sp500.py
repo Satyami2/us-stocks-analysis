@@ -1,28 +1,27 @@
 """
-S&P 500 Rolling Returns Dashboard — Streamlit (Cloud-friendly)
-==============================================================
-Interactive dashboard for ~10 years of S&P 500 price data and
-3-year daily rolling returns.
+US Stocks Multibagger Dashboard — Streamlit
+============================================
+~3000 Russell-3000 stocks · 10 years of daily prices · 1Y/3Y/5Y rolling CAGR
++ multibagger flagging (10x+) and market-cap tier highlighting.
 
-Setup (local):
+Setup:
     pip install streamlit yfinance pandas numpy plotly lxml requests pyarrow
-    streamlit run sp500_streamlit_app.py
+
+Run:
+    streamlit run us_stocks_multibagger_app.py
 
 Streamlit Cloud (requirements.txt):
-    streamlit
-    yfinance
-    pandas
-    numpy
-    plotly
-    lxml
-    requests
-    pyarrow
+    streamlit>=1.30
+    yfinance>=0.2.40
+    pandas>=2.0
+    numpy>=1.24
+    plotly>=5.18
+    lxml>=4.9
+    requests>=2.31
+    pyarrow>=14.0
 
-Notes on cloud deploys:
-- Streamlit Cloud filesystems are ephemeral — parquet cache may not persist
-  between container restarts. First load after a cold start will re-download.
-- Downloading all 500 tickers can take 10-20 min. Use the "quick start" option
-  (top 100 by default) to stay within reasonable limits.
+IMPORTANT: First-time download for ~3000 tickers takes 30-60 minutes and may
+hit Yahoo rate limits. Use the universe-size selector to start smaller.
 """
 
 import os
@@ -41,8 +40,8 @@ import plotly.express as px
 # PAGE CONFIG
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="S&P 500 Rolling Returns Dashboard",
-    page_icon="📈",
+    page_title="US Stocks Multibagger Dashboard",
+    page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -50,42 +49,91 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-YEARS_BACK     = 10
-ROLLING_WINDOW = 756          # ~3 trading years
-CACHE_DIR      = "sp500_cache"
-PRICES_FILE    = os.path.join(CACHE_DIR, "prices.parquet")
-META_FILE      = os.path.join(CACHE_DIR, "meta.parquet")
-BATCH_SIZE     = 50
-SLEEP_BETWEEN  = 0.5
+YEARS_BACK    = 10
+W_1Y          = 252           # ~1 trading year
+W_3Y          = 756           # ~3 trading years
+W_5Y          = 1260          # ~5 trading years
+MULTIBAGGER_X = 10.0          # 10x+ over 10 years
+
+CACHE_DIR     = "us_cache"
+PRICES_FILE   = os.path.join(CACHE_DIR, "prices.parquet")
+META_FILE     = os.path.join(CACHE_DIR, "meta.parquet")
+MCAP_FILE     = os.path.join(CACHE_DIR, "mcap.parquet")
+
+BATCH_SIZE    = 50
+SLEEP_BETWEEN = 0.4
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# DATA LOADING
+# UNIVERSE — Russell 3000 sources
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
-def get_sp500_tickers() -> pd.DataFrame:
-    """Scrape S&P 500 constituents from Wikipedia. Robust to pandas>=2.2."""
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; sp500-dashboard/1.0)"}
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    # FIX: wrap HTML in StringIO — pandas>=2.2 no longer accepts raw HTML strings
-    tables = pd.read_html(io.StringIO(resp.text))
-    df = tables[0][["Symbol", "Security", "GICS Sector", "GICS Sub-Industry"]].copy()
-    df["Symbol"] = df["Symbol"].astype(str).str.replace(".", "-", regex=False)
-    df = df.rename(columns={
-        "Symbol":   "Ticker",
-        "Security": "Company",
-        "GICS Sector":       "Sector",
-        "GICS Sub-Industry": "Industry",
-    })
-    return df.reset_index(drop=True)
+def get_russell3000_tickers() -> pd.DataFrame:
+    """
+    Build a Russell 3000-style universe.
+    Strategy:
+      1. NASDAQ Trader's official nasdaqlisted.txt + otherlisted.txt (NYSE/AMEX)
+      2. Filter out test issues, ETFs, warrants, units, preferred shares
+    Result: ~5500-6500 common stocks across NYSE/NASDAQ/AMEX.
+    We then take the top ~3000 by liquidity proxy (priced > $1).
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    def _fetch(url):
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        return r.text
+
+    # NASDAQ-listed
+    try:
+        nas_txt = _fetch("https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt")
+        nas = pd.read_csv(io.StringIO(nas_txt), sep="|")
+        nas = nas[nas["Test Issue"] == "N"]
+        nas = nas[nas["ETF"] == "N"]
+        nas = nas.rename(columns={"Symbol": "Ticker", "Security Name": "Company"})
+        nas["Exchange"] = "NASDAQ"
+        nas = nas[["Ticker", "Company", "Exchange"]]
+    except Exception:
+        nas = pd.DataFrame(columns=["Ticker", "Company", "Exchange"])
+
+    # NYSE / AMEX-listed
+    try:
+        oth_txt = _fetch("https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt")
+        oth = pd.read_csv(io.StringIO(oth_txt), sep="|")
+        oth = oth[oth["Test Issue"] == "N"]
+        oth = oth[oth["ETF"] == "N"]
+        oth = oth.rename(columns={"ACT Symbol": "Ticker",
+                                  "Security Name": "Company",
+                                  "Exchange": "ExCode"})
+        ex_map = {"N": "NYSE", "A": "NYSE American", "P": "NYSE Arca",
+                  "Z": "BATS", "V": "IEX"}
+        oth["Exchange"] = oth["ExCode"].map(ex_map).fillna("Other")
+        oth = oth[["Ticker", "Company", "Exchange"]]
+    except Exception:
+        oth = pd.DataFrame(columns=["Ticker", "Company", "Exchange"])
+
+    df = pd.concat([nas, oth], ignore_index=True).dropna(subset=["Ticker"])
+    df = df[df["Ticker"].astype(str).str.match(r"^[A-Z][A-Z0-9.\-]*$")]
+    # Yahoo uses '-' in place of '.'
+    df["Ticker"] = df["Ticker"].str.replace(".", "-", regex=False)
+    # Drop suspicious suffixes (warrants, units, rights)
+    bad_suffix = ("W", "WS", "U", "R", "RT", "P")
+    df = df[~df["Ticker"].str.endswith(bad_suffix)]
+    # Strip prefixes like 'WARRANT', 'UNIT', 'PREF' in name
+    bad_words = ["WARRANT", "UNIT", "PREFERRED", "RIGHT", "DEPOSITARY",
+                 "ETF", "TRUST", "FUND"]
+    pat = "|".join(bad_words)
+    df = df[~df["Company"].str.upper().str.contains(pat, na=False)]
+    df = df.drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
+    return df
 
 
+# ---------------------------------------------------------------------------
+# PRICE DOWNLOAD
+# ---------------------------------------------------------------------------
 def download_batch(tickers, start, end):
-    """Download one batch of tickers → wide DataFrame of Close prices."""
     try:
         data = yf.download(
             tickers=" ".join(tickers),
@@ -98,7 +146,6 @@ def download_batch(tickers, start, end):
         )
         if data is None or data.empty:
             return pd.DataFrame()
-
         closes = {}
         if len(tickers) == 1:
             t = tickers[0]
@@ -113,12 +160,12 @@ def download_batch(tickers, start, end):
                     except Exception:
                         continue
         return pd.DataFrame(closes)
-    except Exception as e:
-        st.warning(f"Batch failed ({tickers[0]}…{tickers[-1]}): {e}")
+    except Exception:
         return pd.DataFrame()
 
 
-def download_prices(tickers, years_back=YEARS_BACK, progress_bar=None, status_text=None):
+def download_prices(tickers, years_back=YEARS_BACK,
+                    progress_bar=None, status_text=None):
     end_date   = datetime.today()
     start_date = end_date.replace(year=end_date.year - years_back)
     start_str  = start_date.strftime("%Y-%m-%d")
@@ -126,123 +173,189 @@ def download_prices(tickers, years_back=YEARS_BACK, progress_bar=None, status_te
 
     batches = [tickers[i:i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
     frames = []
+    n_ok = 0
     for i, batch in enumerate(batches):
         if status_text is not None:
             status_text.text(
-                f"Downloading batch {i + 1}/{len(batches)} "
-                f"({batch[0]}…{batch[-1]}) — {len(frames)} batches loaded"
+                f"Batch {i + 1}/{len(batches)} ({batch[0]}…{batch[-1]}) · "
+                f"loaded {n_ok} batches"
             )
         df = download_batch(batch, start_str, end_str)
         if not df.empty:
-            frames.append(df)
+            frames.append(df); n_ok += 1
         if progress_bar is not None:
             progress_bar.progress((i + 1) / len(batches))
         time.sleep(SLEEP_BETWEEN)
 
     if not frames:
-        raise RuntimeError("No data downloaded. Yahoo Finance may be rate-limiting.")
+        raise RuntimeError("No data downloaded. Yahoo may be rate-limiting.")
     prices = pd.concat(frames, axis=1)
     prices = prices.loc[:, ~prices.columns.duplicated()]
     return prices.sort_index().dropna(how="all")
 
 
-def load_from_disk():
-    """Try to load cached parquet files from disk."""
-    if os.path.exists(PRICES_FILE) and os.path.exists(META_FILE):
+# ---------------------------------------------------------------------------
+# MARKET CAP & SECTOR (yfinance .info — slow, batched)
+# ---------------------------------------------------------------------------
+def fetch_metadata(tickers, progress_bar=None, status_text=None):
+    """Pull market cap, sector, industry via yf.Ticker.info — best effort."""
+    rows = []
+    for i, t in enumerate(tickers):
+        if status_text is not None and i % 25 == 0:
+            status_text.text(f"Fetching metadata {i}/{len(tickers)}…")
+        if progress_bar is not None and len(tickers) > 0:
+            progress_bar.progress((i + 1) / len(tickers))
         try:
-            return pd.read_parquet(PRICES_FILE), pd.read_parquet(META_FILE)
+            info = yf.Ticker(t).info or {}
+            rows.append({
+                "Ticker":   t,
+                "MarketCap": info.get("marketCap", np.nan),
+                "Sector":   info.get("sector", "Unknown"),
+                "Industry": info.get("industry", "Unknown"),
+            })
         except Exception:
-            return None, None
-    return None, None
+            rows.append({"Ticker": t, "MarketCap": np.nan,
+                         "Sector": "Unknown", "Industry": "Unknown"})
+        time.sleep(0.05)
+    return pd.DataFrame(rows)
 
 
-def fetch_and_cache(n_tickers=None):
-    """Download pipeline with progress UI. n_tickers=None means all."""
-    status = st.empty()
-    pbar   = st.progress(0.0)
+def cap_tier(mcap):
+    if pd.isna(mcap): return "Unknown"
+    if mcap >= 200e9: return "Mega ($200B+)"
+    if mcap >= 10e9:  return "Large ($10B-200B)"
+    if mcap >= 2e9:   return "Mid ($2B-10B)"
+    if mcap >= 300e6: return "Small ($300M-2B)"
+    if mcap >= 50e6:  return "Micro ($50M-300M)"
+    return "Nano (<$50M)"
 
-    status.text("Fetching S&P 500 constituents from Wikipedia…")
-    meta = get_sp500_tickers()
 
-    if n_tickers is not None and n_tickers < len(meta):
-        meta = meta.head(n_tickers).reset_index(drop=True)
-        status.text(f"Limited to first {n_tickers} tickers. Starting download…")
-    else:
-        status.text(f"Found {len(meta)} constituents. Starting download…")
+# ---------------------------------------------------------------------------
+# DISK CACHE
+# ---------------------------------------------------------------------------
+def load_from_disk():
+    try:
+        if (os.path.exists(PRICES_FILE) and os.path.exists(META_FILE)
+                and os.path.exists(MCAP_FILE)):
+            prices = pd.read_parquet(PRICES_FILE)
+            meta   = pd.read_parquet(META_FILE)
+            mcap   = pd.read_parquet(MCAP_FILE)
+            return prices, meta, mcap
+    except Exception:
+        pass
+    return None, None, None
 
-    prices = download_prices(
-        meta["Ticker"].tolist(),
-        years_back=YEARS_BACK,
-        progress_bar=pbar,
-        status_text=status,
-    )
-    # Keep only meta rows we actually have prices for
-    meta = meta[meta["Ticker"].isin(prices.columns)].reset_index(drop=True)
 
+def save_to_disk(prices, meta, mcap):
     try:
         prices.to_parquet(PRICES_FILE)
         meta.to_parquet(META_FILE)
+        mcap.to_parquet(MCAP_FILE)
     except Exception:
-        pass  # ephemeral FS on some hosts — fine, we keep it in session_state
+        pass
 
-    pbar.empty()
-    status.empty()
-    return prices, meta
+
+def fetch_full_pipeline(n_tickers=None, fetch_mcap=True):
+    status = st.empty()
+    pbar   = st.progress(0.0)
+
+    status.text("Fetching US listed-stocks universe…")
+    universe = get_russell3000_tickers()
+    if n_tickers is not None and n_tickers < len(universe):
+        universe = universe.head(n_tickers).reset_index(drop=True)
+        status.text(f"Universe limited to {n_tickers} tickers · "
+                    f"downloading prices…")
+    else:
+        status.text(f"Universe: {len(universe)} tickers · downloading prices…")
+
+    prices = download_prices(
+        universe["Ticker"].tolist(),
+        years_back=YEARS_BACK,
+        progress_bar=pbar, status_text=status,
+    )
+
+    meta = universe[universe["Ticker"].isin(prices.columns)].reset_index(drop=True)
+
+    if fetch_mcap:
+        status.text("Fetching market caps & sectors (this is the slow part)…")
+        pbar.progress(0.0)
+        mcap = fetch_metadata(meta["Ticker"].tolist(),
+                              progress_bar=pbar, status_text=status)
+    else:
+        mcap = pd.DataFrame({"Ticker": meta["Ticker"],
+                             "MarketCap": np.nan,
+                             "Sector": "Unknown",
+                             "Industry": "Unknown"})
+
+    save_to_disk(prices, meta, mcap)
+    pbar.empty(); status.empty()
+    return prices, meta, mcap
 
 
 # ---------------------------------------------------------------------------
 # CALCULATIONS
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def compute_daily_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    return prices.pct_change().dropna(how="all")
-
-
-@st.cache_data(show_spinner=False)
-def compute_rolling_3yr(prices: pd.DataFrame, window: int = ROLLING_WINDOW) -> pd.DataFrame:
+def compute_rolling_cagr(prices: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Daily rolling annualised CAGR for a given window in trading days."""
+    years = window / 252.0
     ratio = prices / prices.shift(window)
-    return (ratio.pow(1.0 / 3.0) - 1.0).dropna(how="all")
+    return (ratio.pow(1.0 / years) - 1.0).dropna(how="all")
 
 
 @st.cache_data(show_spinner=False)
-def build_summary(prices: pd.DataFrame, rolling: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
-    if rolling.empty:
-        latest = pd.Series(dtype=float)
-    else:
-        latest = rolling.iloc[-1]
-
-    mean_3yr   = rolling.mean()
-    median_3yr = rolling.median()
-    std_3yr    = rolling.std()
-    min_3yr    = rolling.min()
-    max_3yr    = rolling.max()
-
+def build_summary(prices: pd.DataFrame,
+                  meta: pd.DataFrame,
+                  mcap: pd.DataFrame,
+                  r1: pd.DataFrame,
+                  r3: pd.DataFrame,
+                  r5: pd.DataFrame) -> pd.DataFrame:
     first_idx = prices.apply(lambda s: s.first_valid_index())
     last_idx  = prices.apply(lambda s: s.last_valid_index())
     first_px  = pd.Series({t: prices[t].loc[first_idx[t]] if pd.notna(first_idx[t]) else np.nan
                            for t in prices.columns})
     last_px   = pd.Series({t: prices[t].loc[last_idx[t]] if pd.notna(last_idx[t]) else np.nan
                            for t in prices.columns})
-    total_ret = last_px / first_px - 1.0
+    total_x   = last_px / first_px            # multiple (e.g. 12.5 = 12.5x)
+    total_ret = total_x - 1.0
 
-    df = pd.DataFrame({
-        "First Date":         first_idx,
-        "Last Date":          last_idx,
-        "First Price":        first_px.round(2),
-        "Last Price":         last_px.round(2),
-        "Total Return (10y)": total_ret.round(4),
-        "Latest 3Y CAGR":     latest.round(4),
-        "Mean 3Y CAGR":       mean_3yr.round(4),
-        "Median 3Y CAGR":     median_3yr.round(4),
-        "Std 3Y CAGR":        std_3yr.round(4),
-        "Min 3Y CAGR":        min_3yr.round(4),
-        "Max 3Y CAGR":        max_3yr.round(4),
-    })
-    df.index.name = "Ticker"
-    df = df.reset_index().merge(meta, on="Ticker", how="left")
-    cols = ["Ticker", "Company", "Sector", "Industry"] + \
-           [c for c in df.columns if c not in ("Ticker", "Company", "Sector", "Industry")]
-    return df[cols]
+    # Years of history
+    yrs = ((last_idx - first_idx).dt.days / 365.25).rename("Years")
+
+    # Rolling stats
+    def stats(df, label):
+        return pd.DataFrame({
+            f"Latest {label} CAGR": df.iloc[-1] if not df.empty else np.nan,
+            f"Median {label} CAGR": df.median(),
+            f"Mean {label} CAGR":   df.mean(),
+        })
+
+    s1 = stats(r1, "1Y")
+    s3 = stats(r3, "3Y")
+    s5 = stats(r5, "5Y")
+
+    summ = pd.DataFrame({
+        "First Date":  first_idx,
+        "Last Date":   last_idx,
+        "First Price": first_px.round(2),
+        "Last Price":  last_px.round(2),
+        "Years":       yrs.round(1),
+        "Multiple (x)":   total_x.round(2),
+        "Total Return":   total_ret.round(4),
+    }).join([s1, s3, s5])
+
+    summ.index.name = "Ticker"
+    summ = summ.reset_index().merge(meta, on="Ticker", how="left")
+    summ = summ.merge(mcap, on="Ticker", how="left")
+
+    summ["Cap Tier"]    = summ["MarketCap"].apply(cap_tier)
+    summ["Multibagger"] = summ["Multiple (x)"] >= MULTIBAGGER_X
+
+    front = ["Ticker", "Company", "Exchange", "Sector", "Industry",
+             "Cap Tier", "MarketCap", "Multibagger",
+             "Multiple (x)", "Total Return", "Years"]
+    rest  = [c for c in summ.columns if c not in front]
+    return summ[front + rest]
 
 
 # ---------------------------------------------------------------------------
@@ -250,40 +363,53 @@ def build_summary(prices: pd.DataFrame, rolling: pd.DataFrame, meta: pd.DataFram
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Controls")
 
-# Session-state persistence (survives reruns without touching disk)
 if "prices" not in st.session_state:
-    disk_prices, disk_meta = load_from_disk()
-    st.session_state.prices = disk_prices
-    st.session_state.meta   = disk_meta
+    p, m, mc = load_from_disk()
+    st.session_state.prices = p
+    st.session_state.meta   = m
+    st.session_state.mcap   = mc
 
 prices = st.session_state.prices
 meta   = st.session_state.meta
+mcap   = st.session_state.mcap
 
 if prices is None:
-    st.title("📈 S&P 500 Rolling Returns Dashboard")
-    st.info("👇 Choose how much data to pull. Larger universes take longer "
-            "and may time out on Streamlit Cloud's free tier.")
+    st.title("🚀 US Stocks Multibagger Dashboard")
+    st.info(
+        "👇 Pick a universe size and download. **Heads up:** the full ~3000-ticker "
+        "Russell 3000 download takes 30-60 minutes and may hit Yahoo rate limits "
+        "on Streamlit Cloud's free tier. Start small to verify the pipeline, then "
+        "scale up."
+    )
 
-    universe = st.sidebar.radio(
+    universe_choice = st.sidebar.radio(
         "Universe size",
-        options=["Top 50 (fastest)", "Top 100", "Top 250", "Full S&P 500"],
-        index=1,
+        options=["Top 200 (test run)", "Top 500", "Top 1000",
+                 "Top 2000", "Full Russell 3000"],
+        index=0,
     )
     size_map = {
-        "Top 50 (fastest)": 50,
-        "Top 100": 100,
-        "Top 250": 250,
-        "Full S&P 500": None,
+        "Top 200 (test run)": 200,
+        "Top 500": 500,
+        "Top 1000": 1000,
+        "Top 2000": 2000,
+        "Full Russell 3000": None,
     }
-    n = size_map[universe]
+    n = size_map[universe_choice]
+
+    fetch_mcap = st.sidebar.checkbox(
+        "Fetch market caps & sectors (slow but enables tier filtering)",
+        value=True,
+    )
 
     if st.sidebar.button("⬇️ Download data", type="primary"):
         try:
-            with st.spinner("Downloading from Yahoo Finance…"):
-                p, m = fetch_and_cache(n_tickers=n)
+            with st.spinner("Downloading…"):
+                p, m, mc = fetch_full_pipeline(n_tickers=n, fetch_mcap=fetch_mcap)
             st.session_state.prices = p
             st.session_state.meta   = m
-            st.sidebar.success(f"Downloaded {p.shape[1]} tickers × {p.shape[0]} days")
+            st.session_state.mcap   = mc
+            st.sidebar.success(f"Loaded {p.shape[1]} tickers × {p.shape[0]} days")
             st.rerun()
         except Exception as e:
             st.error(f"Download failed: {e}")
@@ -301,309 +427,347 @@ else:
     if st.sidebar.button("🔄 Re-download"):
         st.session_state.prices = None
         st.session_state.meta   = None
+        st.session_state.mcap   = None
         st.cache_data.clear()
         st.rerun()
 
-# Pre-compute derivatives
-daily_ret = compute_daily_returns(prices)
-rolling   = compute_rolling_3yr(prices)
-summary   = build_summary(prices, rolling, meta)
+# Pre-compute derived data
+with st.spinner("Computing rolling returns…"):
+    r1 = compute_rolling_cagr(prices, W_1Y)
+    r3 = compute_rolling_cagr(prices, W_3Y)
+    r5 = compute_rolling_cagr(prices, W_5Y)
+    summary = build_summary(prices, meta, mcap, r1, r3, r5)
 
 # ---------------------------------------------------------------------------
-# FILTERS
+# SIDEBAR — FILTERS
 # ---------------------------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.subheader("🎯 Filters")
 
-sectors = sorted(meta["Sector"].dropna().unique().tolist())
+cap_tiers = ["Mega ($200B+)", "Large ($10B-200B)", "Mid ($2B-10B)",
+             "Small ($300M-2B)", "Micro ($50M-300M)", "Nano (<$50M)", "Unknown"]
+present_tiers = [t for t in cap_tiers if t in summary["Cap Tier"].unique()]
+selected_tiers = st.sidebar.multiselect("Market-cap tier", present_tiers,
+                                        default=present_tiers)
+
+sectors = sorted([s for s in summary["Sector"].dropna().unique() if s])
 selected_sectors = st.sidebar.multiselect("Sector", sectors, default=sectors)
 
-min_date = prices.index.min().date()
-max_date = prices.index.max().date()
-date_range = st.sidebar.date_input(
-    "Date range",
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
-)
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    d0, d1 = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
-else:
-    d0, d1 = pd.Timestamp(min_date), pd.Timestamp(max_date)
+multibagger_only = st.sidebar.checkbox(f"🚀 Multibaggers only (≥{MULTIBAGGER_X:.0f}x)")
 
-filt_meta    = meta[meta["Sector"].isin(selected_sectors)]
-filt_tickers = filt_meta["Ticker"].tolist()
-filt_summary = summary[summary["Ticker"].isin(filt_tickers)]
+min_years = st.sidebar.slider("Min years of history", 1, 10, 3)
 
-if not filt_tickers:
+filt = summary[
+    summary["Cap Tier"].isin(selected_tiers)
+    & summary["Sector"].isin(selected_sectors + [None])
+    & (summary["Years"].fillna(0) >= min_years)
+]
+if multibagger_only:
+    filt = filt[filt["Multibagger"]]
+
+if filt.empty:
     st.warning("No tickers match the current filters.")
     st.stop()
 
 # ---------------------------------------------------------------------------
-# MAIN — TABS
+# MAIN
 # ---------------------------------------------------------------------------
-st.title("📈 S&P 500 Rolling Returns Dashboard")
-st.caption(f"Daily prices from Yahoo Finance · 3-year rolling CAGR · "
-           f"Data through {prices.index.max().strftime('%B %d, %Y')}")
+st.title("🚀 US Stocks Multibagger Dashboard")
+st.caption(
+    f"Russell-3000 universe · daily prices from Yahoo Finance · "
+    f"1Y/3Y/5Y rolling CAGR · multibagger ≥ {MULTIBAGGER_X:.0f}× · "
+    f"data through {prices.index.max().strftime('%B %d, %Y')}"
+)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🏠 Overview", "📊 Ticker Explorer", "🔥 Sectors",
-    "🏆 Rankings", "📥 Download"
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🏠 Overview", "🚀 Multibaggers", "📊 Ticker Explorer",
+    "🔥 Sectors & Caps", "🏆 Rankings", "📥 Download"
 ])
 
 # ---------- TAB 1: OVERVIEW ----------
 with tab1:
     st.subheader("Market snapshot")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Tickers covered", f"{len(filt_summary):,}")
-    c2.metric("Median latest 3Y CAGR",
-              f"{filt_summary['Latest 3Y CAGR'].median() * 100:.2f}%"
-              if filt_summary['Latest 3Y CAGR'].notna().any() else "—")
-    c3.metric("Median 10Y total return",
-              f"{filt_summary['Total Return (10y)'].median() * 100:.1f}%"
-              if filt_summary['Total Return (10y)'].notna().any() else "—")
-    c4.metric("Positive 3Y CAGR",
-              f"{(filt_summary['Latest 3Y CAGR'] > 0).mean() * 100:.1f}%"
-              if filt_summary['Latest 3Y CAGR'].notna().any() else "—")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Tickers in view",     f"{len(filt):,}")
+    c2.metric("Multibaggers (10x+)", f"{int(filt['Multibagger'].sum()):,}",
+              f"{filt['Multibagger'].mean() * 100:.1f}% of view")
+    c3.metric("Median 1Y CAGR",
+              f"{filt['Median 1Y CAGR'].median() * 100:.2f}%"
+              if filt['Median 1Y CAGR'].notna().any() else "—")
+    c4.metric("Median 3Y CAGR",
+              f"{filt['Median 3Y CAGR'].median() * 100:.2f}%"
+              if filt['Median 3Y CAGR'].notna().any() else "—")
+    c5.metric("Median 5Y CAGR",
+              f"{filt['Median 5Y CAGR'].median() * 100:.2f}%"
+              if filt['Median 5Y CAGR'].notna().any() else "—")
 
     st.divider()
 
-    colL, colR = st.columns(2)
-    with colL:
-        st.markdown("**Distribution — Latest 3Y CAGR**")
-        data_ = filt_summary.dropna(subset=["Latest 3Y CAGR"])
-        if not data_.empty:
-            fig = px.histogram(data_, x="Latest 3Y CAGR", nbins=50, color="Sector")
-            fig.update_layout(xaxis_tickformat=".0%", height=400,
-                              margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Not enough history for 3Y CAGR yet.")
-
-    with colR:
-        st.markdown("**Distribution — 10-year Total Return**")
-        data_ = filt_summary.dropna(subset=["Total Return (10y)"])
-        if not data_.empty:
-            fig = px.histogram(data_, x="Total Return (10y)", nbins=50, color="Sector")
-            fig.update_layout(xaxis_tickformat=".0%", height=400,
-                              margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-    st.markdown("**Risk vs. Return — Std dev of 3Y CAGR vs. Mean 3Y CAGR**")
-    scat = filt_summary.dropna(subset=["Mean 3Y CAGR", "Std 3Y CAGR"])
-    if not scat.empty:
-        fig = px.scatter(
-            scat, x="Std 3Y CAGR", y="Mean 3Y CAGR",
-            color="Sector", hover_name="Ticker",
-            hover_data={"Company": True, "Latest 3Y CAGR": ":.2%"},
-            opacity=0.75,
-        )
-        fig.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%",
-                          height=550, margin=dict(l=10, r=10, t=30, b=10))
+    st.markdown("**Total return multiple — distribution (log scale)**")
+    plot_df = filt.dropna(subset=["Multiple (x)"])
+    plot_df = plot_df[plot_df["Multiple (x)"] > 0]
+    if not plot_df.empty:
+        fig = px.histogram(plot_df, x="Multiple (x)", nbins=60,
+                           color="Cap Tier", log_x=True)
+        fig.add_vline(x=MULTIBAGGER_X, line_dash="dash", line_color="red",
+                      annotation_text=f"{MULTIBAGGER_X:.0f}x cutoff")
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
+                          xaxis_title="Total return multiple (log)")
         st.plotly_chart(fig, use_container_width=True)
 
-# ---------- TAB 2: TICKER EXPLORER ----------
+    st.divider()
+    st.markdown("**Rolling CAGR distributions**")
+    c1, c2, c3 = st.columns(3)
+    for col, label, container in [("Latest 1Y CAGR", "1Y", c1),
+                                  ("Latest 3Y CAGR", "3Y", c2),
+                                  ("Latest 5Y CAGR", "5Y", c3)]:
+        with container:
+            sub = filt.dropna(subset=[col])
+            if not sub.empty:
+                fig = px.histogram(sub, x=col, nbins=50, color="Cap Tier")
+                fig.add_vline(x=0, line_dash="dash", line_color="grey")
+                fig.update_layout(height=320, xaxis_tickformat=".0%",
+                                  margin=dict(l=10, r=10, t=30, b=10),
+                                  showlegend=False, title=f"{label} CAGR")
+                st.plotly_chart(fig, use_container_width=True)
+
+# ---------- TAB 2: MULTIBAGGERS ----------
 with tab2:
-    st.subheader("Individual ticker analysis")
+    st.subheader(f"🚀 Multibaggers (≥{MULTIBAGGER_X:.0f}× over their life)")
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        default_pick = "AAPL" if "AAPL" in filt_tickers else filt_tickers[0]
-        ticker = st.selectbox(
-            "Choose a ticker",
-            options=filt_tickers,
-            index=filt_tickers.index(default_pick) if default_pick in filt_tickers else 0,
-        )
-    with col2:
-        compare_opts = [t for t in filt_tickers if t != ticker]
-        default_cmp = ["MSFT"] if "MSFT" in compare_opts and ticker != "MSFT" else []
-        compare = st.multiselect("Compare against", options=compare_opts, default=default_cmp)
+    mb = filt[filt["Multibagger"]].sort_values("Multiple (x)", ascending=False)
 
-    info = meta[meta["Ticker"] == ticker].iloc[0]
-    st.markdown(f"### {info['Company']} ({ticker})")
-    st.caption(f"{info['Sector']} · {info['Industry']}")
+    if mb.empty:
+        st.info("No multibaggers in the current filter view.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Multibaggers", f"{len(mb):,}")
+        c2.metric("Best multiple", f"{mb['Multiple (x)'].max():.1f}×",
+                  delta=mb.iloc[0]["Ticker"])
+        c3.metric("Median multiple", f"{mb['Multiple (x)'].median():.1f}×")
+        c4.metric("Median 5Y CAGR",
+                  f"{mb['Median 5Y CAGR'].median() * 100:.1f}%"
+                  if mb['Median 5Y CAGR'].notna().any() else "—")
 
-    row = summary[summary["Ticker"] == ticker].iloc[0]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Latest Price",
-              f"${row['Last Price']:.2f}" if pd.notna(row['Last Price']) else "—")
-    m2.metric("10Y Total Return",
-              f"{row['Total Return (10y)'] * 100:.1f}%" if pd.notna(row['Total Return (10y)']) else "—")
-    m3.metric("Latest 3Y CAGR",
-              f"{row['Latest 3Y CAGR'] * 100:.2f}%" if pd.notna(row['Latest 3Y CAGR']) else "—")
-    m4.metric("3Y CAGR Volatility",
-              f"{row['Std 3Y CAGR'] * 100:.2f}%" if pd.notna(row['Std 3Y CAGR']) else "—")
-
-    tickers_to_plot = [ticker] + compare
-
-    st.markdown("**Normalised price (first value = 100)**")
-    px_window = prices.loc[d0:d1, tickers_to_plot].dropna(how="all")
-    if not px_window.empty:
-        norm = px_window.apply(lambda s: s / s.dropna().iloc[0] * 100
-                               if s.dropna().size else s)
-        fig = px.line(norm, labels={"value": "Indexed", "variable": "Ticker"})
-        fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10),
-                          hovermode="x unified")
+        st.divider()
+        st.markdown("**Top 30 multibaggers**")
+        top30 = mb.head(30)
+        fig = px.bar(top30, x="Multiple (x)", y="Ticker",
+                     color="Cap Tier", orientation="h",
+                     hover_data={"Company": True, "Sector": True,
+                                 "Multiple (x)": ":.1f"})
+        fig.update_layout(height=720,
+                          yaxis={'categoryorder': 'total ascending'},
+                          margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("**3-Year Rolling CAGR (annualised)**")
-    roll_window = rolling.loc[d0:d1, [t for t in tickers_to_plot if t in rolling.columns]]
-    roll_window = roll_window.dropna(how="all")
-    if not roll_window.empty:
-        fig = px.line(roll_window, labels={"value": "3Y CAGR", "variable": "Ticker"})
-        fig.add_hline(y=0, line_dash="dash", line_color="red", opacity=0.5)
-        fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10),
-                          yaxis_tickformat=".0%", hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Not enough history for 3Y rolling returns yet (need ~3 years of data).")
-
-    st.markdown("**Daily return distribution**")
-    if ticker in daily_ret.columns:
-        dr = daily_ret.loc[d0:d1, ticker].dropna()
-        if not dr.empty:
-            fig = px.histogram(dr, nbins=80)
-            fig.update_layout(height=320, showlegend=False, xaxis_tickformat=".1%",
-                              margin=dict(l=10, r=10, t=30, b=10),
-                              xaxis_title="Daily return", yaxis_title="Count")
-            st.plotly_chart(fig, use_container_width=True)
-
-# ---------- TAB 3: SECTORS ----------
-with tab3:
-    st.subheader("Sector-level view")
-
-    sec = (filt_summary.groupby("Sector")
-           .agg(Tickers=("Ticker", "count"),
-                **{"Mean 10Y Total Return": ("Total Return (10y)", "mean"),
-                   "Median 10Y Total Return": ("Total Return (10y)", "median"),
-                   "Mean Latest 3Y CAGR":    ("Latest 3Y CAGR", "mean"),
-                   "Median Latest 3Y CAGR":  ("Latest 3Y CAGR", "median"),
-                   "Mean 3Y Volatility":     ("Std 3Y CAGR", "mean")})
-           .sort_values("Mean Latest 3Y CAGR", ascending=False, na_position="last"))
-
-    c1, c2 = st.columns(2)
-    with c1:
-        plot_df = sec.reset_index().dropna(subset=["Mean Latest 3Y CAGR"])
-        if not plot_df.empty:
-            fig = px.bar(plot_df, x="Sector", y="Mean Latest 3Y CAGR",
-                         color="Mean Latest 3Y CAGR", color_continuous_scale="RdYlGn")
-            fig.update_layout(yaxis_tickformat=".1%", height=420,
-                              margin=dict(l=10, r=10, t=30, b=10), showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-    with c2:
-        plot_df = sec.reset_index().dropna(subset=["Mean 10Y Total Return"])
-        if not plot_df.empty:
-            fig = px.bar(plot_df, x="Sector", y="Mean 10Y Total Return",
-                         color="Mean 10Y Total Return", color_continuous_scale="RdYlGn")
-            fig.update_layout(yaxis_tickformat=".0%", height=420,
-                              margin=dict(l=10, r=10, t=30, b=10), showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("**Mean 3Y rolling CAGR over time — by sector**")
-    sector_map = meta.set_index("Ticker")["Sector"]
-    in_rolling = [t for t in filt_tickers if t in rolling.columns]
-    if in_rolling:
-        rolling_filt = rolling[in_rolling]
-        sector_ts = rolling_filt.T.groupby(sector_map).mean().T
-        sector_ts = sector_ts.loc[d0:d1]
-        if not sector_ts.empty:
-            fig = px.line(sector_ts)
-            fig.update_layout(yaxis_tickformat=".0%", height=500, hovermode="x unified",
-                              margin=dict(l=10, r=10, t=30, b=10),
-                              legend_title_text="Sector")
-            fig.add_hline(y=0, line_dash="dash", line_color="red", opacity=0.4)
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("**Sector summary**")
-    st.dataframe(
-        sec.style.format({
-            "Mean 10Y Total Return":   "{:.1%}",
-            "Median 10Y Total Return": "{:.1%}",
-            "Mean Latest 3Y CAGR":     "{:.2%}",
-            "Median Latest 3Y CAGR":   "{:.2%}",
-            "Mean 3Y Volatility":      "{:.2%}",
-        }, na_rep="—"),
-        use_container_width=True,
-    )
-
-# ---------- TAB 4: RANKINGS ----------
-with tab4:
-    st.subheader("Top / bottom performers")
-
-    metric_choice = st.radio(
-        "Rank by",
-        ["Latest 3Y CAGR", "Mean 3Y CAGR", "Total Return (10y)", "Std 3Y CAGR"],
-        horizontal=True,
-    )
-    top_n = st.slider("How many", 5, 50, 20)
-
-    ranked = filt_summary.dropna(subset=[metric_choice]).sort_values(metric_choice, ascending=False)
-    if ranked.empty:
-        st.info("Not enough data for ranking on this metric.")
-    else:
-        top    = ranked.head(top_n)
-        bottom = ranked.tail(top_n).iloc[::-1]
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown(f"**🏆 Top {top_n}**")
-            fig = px.bar(top, x=metric_choice, y="Ticker", color="Sector",
-                         orientation="h",
-                         hover_data={"Company": True, metric_choice: ":.2%"})
-            fig.update_layout(height=max(400, 25 * top_n),
-                              yaxis={'categoryorder': 'total ascending'},
-                              xaxis_tickformat=".1%",
-                              margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        with c2:
-            st.markdown(f"**📉 Bottom {top_n}**")
-            fig = px.bar(bottom, x=metric_choice, y="Ticker", color="Sector",
-                         orientation="h",
-                         hover_data={"Company": True, metric_choice: ":.2%"})
-            fig.update_layout(height=max(400, 25 * top_n),
-                              yaxis={'categoryorder': 'total descending'},
-                              xaxis_tickformat=".1%",
-                              margin=dict(l=10, r=10, t=30, b=10))
+        st.divider()
+        st.markdown("**Sector mix of multibaggers**")
+        sec_mix = (mb.groupby(["Sector", "Cap Tier"]).size()
+                   .reset_index(name="Count"))
+        if not sec_mix.empty:
+            fig = px.bar(sec_mix, x="Sector", y="Count", color="Cap Tier",
+                         barmode="stack")
+            fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
-        st.markdown("**Full ranked table**")
-        display_df = ranked.copy()
-        for col in ["Total Return (10y)", "Latest 3Y CAGR", "Mean 3Y CAGR",
-                    "Median 3Y CAGR", "Std 3Y CAGR", "Min 3Y CAGR", "Max 3Y CAGR"]:
-            display_df[col] = (display_df[col] * 100).round(2)
-        st.dataframe(display_df, use_container_width=True, height=500)
+        st.markdown("**Full multibagger list**")
+        show_cols = ["Ticker", "Company", "Sector", "Cap Tier", "MarketCap",
+                     "Multiple (x)", "Years",
+                     "Median 1Y CAGR", "Median 3Y CAGR", "Median 5Y CAGR"]
+        disp = mb[show_cols].copy()
+        for c in ["Median 1Y CAGR", "Median 3Y CAGR", "Median 5Y CAGR"]:
+            disp[c] = (disp[c] * 100).round(2)
+        disp["MarketCap"] = (disp["MarketCap"] / 1e9).round(2)
+        disp = disp.rename(columns={"MarketCap": "MarketCap ($B)"})
+        st.dataframe(disp, use_container_width=True, height=520)
 
-# ---------- TAB 5: DOWNLOAD ----------
+# ---------- TAB 3: TICKER EXPLORER ----------
+with tab3:
+    st.subheader("Individual ticker analysis")
+
+    avail = filt["Ticker"].tolist()
+    default_pick = "AAPL" if "AAPL" in avail else avail[0]
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        ticker = st.selectbox("Choose a ticker", options=avail,
+                              index=avail.index(default_pick))
+    with col2:
+        compare_opts = [t for t in avail if t != ticker]
+        compare = st.multiselect("Compare against", options=compare_opts, default=[])
+
+    row = summary[summary["Ticker"] == ticker].iloc[0]
+    badge = "🚀 Multibagger" if row["Multibagger"] else ""
+    st.markdown(f"### {row['Company']} ({ticker}) {badge}")
+    st.caption(f"{row['Exchange']} · {row['Sector']} · {row['Industry']} · "
+               f"{row['Cap Tier']}")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Last Price",
+              f"${row['Last Price']:.2f}" if pd.notna(row['Last Price']) else "—")
+    m2.metric("Total Multiple",
+              f"{row['Multiple (x)']:.2f}×" if pd.notna(row['Multiple (x)']) else "—")
+    m3.metric("Latest 1Y CAGR",
+              f"{row['Latest 1Y CAGR'] * 100:.1f}%"
+              if pd.notna(row['Latest 1Y CAGR']) else "—")
+    m4.metric("Latest 3Y CAGR",
+              f"{row['Latest 3Y CAGR'] * 100:.1f}%"
+              if pd.notna(row['Latest 3Y CAGR']) else "—")
+    m5.metric("Latest 5Y CAGR",
+              f"{row['Latest 5Y CAGR'] * 100:.1f}%"
+              if pd.notna(row['Latest 5Y CAGR']) else "—")
+
+    tickers_to_plot = [ticker] + compare
+
+    st.markdown("**Normalised price (start = 100, log scale)**")
+    px_win = prices[tickers_to_plot].dropna(how="all")
+    if not px_win.empty:
+        norm = px_win.apply(lambda s: s / s.dropna().iloc[0] * 100
+                            if s.dropna().size else s)
+        fig = px.line(norm, log_y=True,
+                      labels={"value": "Indexed (log)", "variable": "Ticker"})
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
+                          hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("**1Y / 3Y / 5Y rolling CAGR (annualised)**")
+    available_cols = [t for t in tickers_to_plot if t in r1.columns]
+    if available_cols:
+        for window_df, lbl in [(r1, "1Y"), (r3, "3Y"), (r5, "5Y")]:
+            sub = window_df[available_cols].dropna(how="all")
+            if not sub.empty:
+                fig = px.line(sub, labels={"value": f"{lbl} CAGR",
+                                           "variable": "Ticker"})
+                fig.add_hline(y=0, line_dash="dash", line_color="red", opacity=0.4)
+                fig.update_layout(height=300, margin=dict(l=10, r=10, t=40, b=10),
+                                  yaxis_tickformat=".0%", hovermode="x unified",
+                                  title=f"{lbl} rolling CAGR")
+                st.plotly_chart(fig, use_container_width=True)
+
+# ---------- TAB 4: SECTORS & CAPS ----------
+with tab4:
+    st.subheader("Sector & market-cap breakdown")
+
+    st.markdown("**Multibagger rate by sector**")
+    sec_stats = (filt.groupby("Sector")
+                 .agg(Tickers=("Ticker", "count"),
+                      Multibaggers=("Multibagger", "sum"),
+                      MultibaggerRate=("Multibagger", "mean"),
+                      MedianMultiple=("Multiple (x)", "median"),
+                      Median1Y=("Median 1Y CAGR", "median"),
+                      Median3Y=("Median 3Y CAGR", "median"),
+                      Median5Y=("Median 5Y CAGR", "median"))
+                 .sort_values("MultibaggerRate", ascending=False))
+
+    plot_df = sec_stats.reset_index()
+    if not plot_df.empty:
+        fig = px.bar(plot_df, x="Sector", y="MultibaggerRate",
+                     color="Multibaggers",
+                     hover_data={"Tickers": True, "Multibaggers": True,
+                                 "MultibaggerRate": ":.1%"},
+                     color_continuous_scale="Greens")
+        fig.update_layout(yaxis_tickformat=".1%", height=420,
+                          margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("**Multibagger rate by market-cap tier**")
+    cap_stats = (filt.groupby("Cap Tier")
+                 .agg(Tickers=("Ticker", "count"),
+                      Multibaggers=("Multibagger", "sum"),
+                      MultibaggerRate=("Multibagger", "mean"),
+                      MedianMultiple=("Multiple (x)", "median"))
+                 .reindex(cap_tiers).dropna(subset=["Tickers"]))
+    plot_df = cap_stats.reset_index()
+    if not plot_df.empty:
+        fig = px.bar(plot_df, x="Cap Tier", y="MultibaggerRate",
+                     color="Multibaggers",
+                     hover_data={"Tickers": True, "MedianMultiple": ":.2f"},
+                     color_continuous_scale="Blues")
+        fig.update_layout(yaxis_tickformat=".1%", height=380,
+                          margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("**Sector summary table**")
+    disp = sec_stats.copy()
+    for c in ["Median1Y", "Median3Y", "Median5Y", "MultibaggerRate"]:
+        disp[c] = (disp[c] * 100).round(2)
+    disp["MedianMultiple"] = disp["MedianMultiple"].round(2)
+    st.dataframe(disp, use_container_width=True)
+
+# ---------- TAB 5: RANKINGS ----------
 with tab5:
-    st.subheader("Download data")
-    st.markdown("Export the underlying and derived datasets as CSV.")
+    st.subheader("Top performers")
 
-    c1, c2, c3 = st.columns(3)
+    metric_choice = st.radio(
+        "Rank by",
+        ["Multiple (x)", "Median 1Y CAGR", "Median 3Y CAGR",
+         "Median 5Y CAGR", "Latest 1Y CAGR", "Latest 3Y CAGR",
+         "Latest 5Y CAGR"],
+        horizontal=True,
+    )
+    top_n = st.slider("How many", 10, 100, 30)
+
+    ranked = filt.dropna(subset=[metric_choice]).sort_values(
+        metric_choice, ascending=False)
+    if ranked.empty:
+        st.info("No data for ranking.")
+    else:
+        top = ranked.head(top_n)
+        fig = px.bar(top, x=metric_choice, y="Ticker", color="Cap Tier",
+                     orientation="h",
+                     hover_data={"Company": True, "Sector": True,
+                                 "Multiple (x)": ":.2f"})
+        is_pct = metric_choice != "Multiple (x)"
+        fig.update_layout(
+            height=max(500, 22 * top_n),
+            yaxis={'categoryorder': 'total ascending'},
+            xaxis_tickformat=".1%" if is_pct else None,
+            margin=dict(l=10, r=10, t=30, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("**Full ranked table**")
+        disp = ranked.copy()
+        for c in ["Latest 1Y CAGR", "Median 1Y CAGR", "Mean 1Y CAGR",
+                  "Latest 3Y CAGR", "Median 3Y CAGR", "Mean 3Y CAGR",
+                  "Latest 5Y CAGR", "Median 5Y CAGR", "Mean 5Y CAGR",
+                  "Total Return"]:
+            if c in disp.columns:
+                disp[c] = (disp[c] * 100).round(2)
+        if "MarketCap" in disp.columns:
+            disp["MarketCap ($B)"] = (disp["MarketCap"] / 1e9).round(2)
+            disp = disp.drop(columns=["MarketCap"])
+        st.dataframe(disp, use_container_width=True, height=520)
+
+# ---------- TAB 6: DOWNLOAD ----------
+with tab6:
+    st.subheader("Download data")
+
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.download_button(
-            "📄 Summary (per ticker)",
-            data=summary.to_csv(index=False).encode(),
-            file_name="sp500_summary.csv",
-            mime="text/csv",
-        )
+        st.download_button("📄 Summary (filtered)",
+                           data=filt.to_csv(index=False).encode(),
+                           file_name="us_stocks_summary_filtered.csv",
+                           mime="text/csv")
     with c2:
-        st.download_button(
-            "📄 3Y Rolling CAGR (daily)",
-            data=rolling.to_csv().encode(),
-            file_name="sp500_3yr_rolling.csv",
-            mime="text/csv",
-        )
+        st.download_button("📄 Summary (all)",
+                           data=summary.to_csv(index=False).encode(),
+                           file_name="us_stocks_summary_all.csv",
+                           mime="text/csv")
     with c3:
-        st.download_button(
-            "📄 Adjusted close prices",
-            data=prices.to_csv().encode(),
-            file_name="sp500_prices.csv",
-            mime="text/csv",
-        )
+        st.download_button("📄 Adjusted close prices",
+                           data=prices.to_csv().encode(),
+                           file_name="us_stocks_prices.csv",
+                           mime="text/csv")
+    with c4:
+        mb = summary[summary["Multibagger"]]
+        st.download_button("🚀 Multibaggers only",
+                           data=mb.to_csv(index=False).encode(),
+                           file_name="us_stocks_multibaggers.csv",
+                           mime="text/csv")
 
     st.divider()
-    st.markdown("**Summary preview**")
-    st.dataframe(summary.head(20), use_container_width=True)
+    st.markdown("**Filtered summary preview**")
+    st.dataframe(filt.head(50), use_container_width=True)
