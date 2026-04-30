@@ -1,16 +1,22 @@
 """
-US Stocks Multibagger Dashboard — Simple
-=========================================
-For each US stock (Russell 3000-style universe):
+US Stocks Multibagger Dashboard
+================================
+For every US stock (full Russell 3000-style universe):
+  - Multibagger flag (10x+ total return)
   - Median 1-year rolling return
-  - Median 3-year rolling return
-  - Total return multiple (10x+ = multibagger)
+  - Median 3-year rolling CAGR
+  - Per-stock rolling returns chart on demand
 
 Setup:
     pip install streamlit yfinance pandas numpy plotly requests pyarrow
 
 Run:
     streamlit run app.py
+
+NOTE: First-time download for the full universe (~5000-6000 tickers) takes
+30-60 minutes and may hit Yahoo Finance rate limits, especially on Streamlit
+Cloud's free tier. Run locally for the full universe; commit the resulting
+cache/*.parquet files to your repo for cloud deploys.
 """
 
 import os
@@ -130,11 +136,13 @@ def download_prices(tickers, pbar, status):
 
     batches = [tickers[i:i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
     frames = []
+    n_ok = 0
     for i, batch in enumerate(batches):
-        status.text(f"Batch {i + 1}/{len(batches)}: {batch[0]}…{batch[-1]}")
+        status.text(f"Batch {i + 1}/{len(batches)} · {batch[0]}…{batch[-1]} · "
+                    f"{n_ok} batches loaded")
         df = download_batch(batch, start, end)
         if not df.empty:
-            frames.append(df)
+            frames.append(df); n_ok += 1
         pbar.progress((i + 1) / len(batches))
         time.sleep(SLEEP_BETWEEN)
 
@@ -154,14 +162,13 @@ def load_cached():
     return None, None
 
 
-def fetch(n_tickers):
+def fetch_all():
+    """Download the full universe."""
     status = st.empty()
     pbar   = st.progress(0.0)
     status.text("Fetching ticker list…")
     universe = get_us_tickers()
-    if n_tickers and n_tickers < len(universe):
-        universe = universe.head(n_tickers).reset_index(drop=True)
-    status.text(f"Downloading {len(universe)} tickers…")
+    status.text(f"Universe size: {len(universe)} tickers · downloading…")
     prices = download_prices(universe["Ticker"].tolist(), pbar, status)
     meta = universe[universe["Ticker"].isin(prices.columns)].reset_index(drop=True)
     try:
@@ -177,13 +184,16 @@ def fetch(n_tickers):
 # CALCULATIONS
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
-    """Per-ticker: median 1Y CAGR, median 3Y CAGR, total return multiple."""
-    # Rolling annualised CAGR
-    r1 = (prices / prices.shift(W_1Y)).pow(1.0 / 1.0) - 1.0
-    r3 = (prices / prices.shift(W_3Y)).pow(1.0 / 3.0) - 1.0
+def compute_rolling(prices: pd.DataFrame, window: int, years: float) -> pd.DataFrame:
+    """Daily annualised rolling CAGR over `window` trading days."""
+    return ((prices / prices.shift(window)).pow(1.0 / years) - 1.0)
 
-    # First & last price for total multiple
+
+@st.cache_data(show_spinner=False)
+def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
+    r1 = compute_rolling(prices, W_1Y, 1.0)
+    r3 = compute_rolling(prices, W_3Y, 3.0)
+
     first_idx = prices.apply(lambda s: s.first_valid_index())
     last_idx  = prices.apply(lambda s: s.last_valid_index())
     first_px  = pd.Series({t: prices[t].loc[first_idx[t]]
@@ -215,7 +225,7 @@ def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR — DATA LOAD
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Controls")
 
@@ -229,16 +239,17 @@ meta   = st.session_state.meta
 
 if prices is None:
     st.title("🚀 US Stocks — Multibaggers")
-    st.info("👇 Pick a universe size and download. Larger = slower.")
-    choice = st.sidebar.radio("Universe size",
-                              ["Top 200 (test)", "Top 500", "Top 1000",
-                               "Top 2000", "All US listed"], index=0)
-    size_map = {"Top 200 (test)": 200, "Top 500": 500, "Top 1000": 1000,
-                "Top 2000": 2000, "All US listed": None}
-    if st.sidebar.button("⬇️ Download data", type="primary"):
+    st.warning(
+        "**Heads-up:** downloading the full US-listed universe "
+        "(~5000-6000 stocks) takes 30-60 minutes and may hit Yahoo Finance "
+        "rate limits — especially on Streamlit Cloud free tier. "
+        "Recommended: run locally and copy `cache/prices.parquet` and "
+        "`cache/meta.parquet` to your deployed repo."
+    )
+    if st.sidebar.button("⬇️ Download ALL US stocks", type="primary"):
         try:
             with st.spinner("Downloading…"):
-                p, m = fetch(size_map[choice])
+                p, m = fetch_all()
             st.session_state.prices = p
             st.session_state.meta   = m
             st.rerun()
@@ -247,9 +258,10 @@ if prices is None:
             st.stop()
     st.stop()
 
-st.sidebar.success(f"✓ {prices.shape[1]} tickers · "
-                   f"{prices.shape[0]:,} days\n\n"
-                   f"Last: {prices.index.max().strftime('%Y-%m-%d')}")
+st.sidebar.success(
+    f"✓ {prices.shape[1]} tickers · {prices.shape[0]:,} days\n\n"
+    f"Last: {prices.index.max().strftime('%Y-%m-%d')}"
+)
 if st.sidebar.button("🔄 Re-download"):
     st.session_state.prices = None
     st.session_state.meta   = None
@@ -257,11 +269,10 @@ if st.sidebar.button("🔄 Re-download"):
     st.rerun()
 
 # ---------------------------------------------------------------------------
-# BUILD SUMMARY
+# SUMMARY + FILTERS
 # ---------------------------------------------------------------------------
 summary = build_summary(prices, meta)
 
-# Sidebar filters
 st.sidebar.divider()
 multibagger_only = st.sidebar.checkbox(f"🚀 Multibaggers only (≥{MULTIBAGGER_X:.0f}×)")
 min_years = st.sidebar.slider("Min years of history", 1, 10, 3)
@@ -277,7 +288,6 @@ st.title("🚀 US Stocks — Multibaggers")
 st.caption(f"{prices.shape[1]} stocks · 10y daily prices from Yahoo Finance · "
            f"Multibagger = {MULTIBAGGER_X:.0f}× total return")
 
-# Top metrics
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Stocks in view", f"{len(view):,}")
 c2.metric("Multibaggers (10×+)", f"{int(view['Multibagger'].sum()):,}",
@@ -292,10 +302,82 @@ c4.metric("Median 3Y CAGR",
 st.divider()
 
 # ---------------------------------------------------------------------------
-# MULTIBAGGERS HIGHLIGHT
+# PER-STOCK ROLLING RETURNS CHART
+# ---------------------------------------------------------------------------
+st.subheader("📈 Per-stock rolling returns")
+
+avail = view["Ticker"].sort_values().tolist()
+if not avail:
+    st.info("No stocks match current filters.")
+else:
+    default_pick = "AAPL" if "AAPL" in avail else avail[0]
+    picked = st.selectbox(
+        "Choose a stock",
+        options=avail,
+        index=avail.index(default_pick),
+        format_func=lambda t: (
+            f"{t} — {summary.loc[summary['Ticker'] == t, 'Company'].iloc[0]}"
+            f"{' 🚀' if summary.loc[summary['Ticker'] == t, 'Multibagger'].iloc[0] else ''}"
+        ),
+    )
+
+    row = summary[summary["Ticker"] == picked].iloc[0]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Multiple",
+              f"{row['Multiple (x)']:.2f}×" if pd.notna(row['Multiple (x)']) else "—",
+              "🚀 Multibagger" if row["Multibagger"] else None)
+    m2.metric("Median 1Y Return",
+              f"{row['Median 1Y Return'] * 100:.2f}%"
+              if pd.notna(row['Median 1Y Return']) else "—")
+    m3.metric("Median 3Y CAGR",
+              f"{row['Median 3Y CAGR'] * 100:.2f}%"
+              if pd.notna(row['Median 3Y CAGR']) else "—")
+    m4.metric("Years of data",
+              f"{row['Years of Data']:.1f}"
+              if pd.notna(row['Years of Data']) else "—")
+
+    # Compute rolling series for this stock only (fast)
+    s = prices[picked].dropna()
+    r1_series = ((s / s.shift(W_1Y)) - 1.0).dropna()
+    r3_series = ((s / s.shift(W_3Y)).pow(1.0 / 3.0) - 1.0).dropna()
+
+    chart_df = pd.DataFrame({
+        "1Y rolling return": r1_series,
+        "3Y rolling CAGR":   r3_series,
+    }).dropna(how="all")
+
+    if chart_df.empty:
+        st.info("Not enough history to compute rolling returns for this stock.")
+    else:
+        fig = px.line(chart_df, labels={"value": "Return", "variable": ""})
+        fig.add_hline(y=0, line_dash="dash", line_color="red", opacity=0.4)
+        # Median reference lines
+        if pd.notna(row["Median 1Y Return"]):
+            fig.add_hline(y=row["Median 1Y Return"], line_dash="dot",
+                          line_color="#1f77b4", opacity=0.5,
+                          annotation_text=f"Median 1Y "
+                                          f"{row['Median 1Y Return']*100:.1f}%",
+                          annotation_position="top left")
+        if pd.notna(row["Median 3Y CAGR"]):
+            fig.add_hline(y=row["Median 3Y CAGR"], line_dash="dot",
+                          line_color="#ff7f0e", opacity=0.5,
+                          annotation_text=f"Median 3Y "
+                                          f"{row['Median 3Y CAGR']*100:.1f}%",
+                          annotation_position="bottom left")
+        fig.update_layout(height=480, yaxis_tickformat=".0%",
+                          hovermode="x unified",
+                          margin=dict(l=10, r=10, t=30, b=10),
+                          legend=dict(orientation="h", yanchor="bottom",
+                                      y=1.02, xanchor="right", x=1))
+        st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# TOP MULTIBAGGERS
 # ---------------------------------------------------------------------------
 mb = view[view["Multibagger"]].sort_values("Multiple (x)", ascending=False)
-
 if not mb.empty:
     st.subheader(f"🚀 Top multibaggers ({len(mb)} found)")
     top_n = min(30, len(mb))
@@ -313,7 +395,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 # FULL TABLE
 # ---------------------------------------------------------------------------
-st.subheader("📊 All stocks — sortable table")
+st.subheader("📊 All stocks — sortable")
 
 display = view.copy().sort_values("Multiple (x)", ascending=False)
 display["Median 1Y Return"] = (display["Median 1Y Return"] * 100).round(2)
