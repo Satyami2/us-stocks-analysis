@@ -13,10 +13,16 @@ Setup:
 Run:
     streamlit run app.py
 
-NOTE: First-time download for the full universe (~5000-6000 tickers) takes
-30-60 minutes and may hit Yahoo Finance rate limits, especially on Streamlit
-Cloud's free tier. Run locally for the full universe; commit the resulting
-cache/*.parquet files to your repo for cloud deploys.
+DATA LOADING ORDER:
+    1. Local cache/*.parquet files (fastest)
+    2. GitHub raw URL fallback (Satyami2/us-stocks-analysis main branch)
+    3. Manual download from Yahoo Finance (slowest, 30-60 min)
+
+To refresh the data on GitHub:
+    1. Run locally, click "🔄 Re-download" in the sidebar
+    2. git add cache/prices.parquet cache/meta.parquet
+    3. git commit -m "Refresh price data"
+    4. git push
 """
 
 import os
@@ -45,6 +51,28 @@ MULTIBAGGER_X = 10.0
 CACHE_DIR     = "cache"
 PRICES_FILE   = os.path.join(CACHE_DIR, "prices.parquet")
 META_FILE     = os.path.join(CACHE_DIR, "meta.parquet")
+
+# GitHub raw URLs — pulled from Satyami2/us-stocks-analysis main branch
+GITHUB_USER   = "Satyami2"
+GITHUB_REPO   = "us-stocks-analysis"
+GITHUB_BRANCH = "main"
+GITHUB_PRICES_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/"
+    f"{GITHUB_BRANCH}/cache/prices.parquet"
+)
+GITHUB_META_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/"
+    f"{GITHUB_BRANCH}/cache/meta.parquet"
+)
+# Git LFS fallback URLs (used automatically if you tracked the files with LFS)
+GITHUB_PRICES_LFS = (
+    f"https://media.githubusercontent.com/media/{GITHUB_USER}/{GITHUB_REPO}/"
+    f"{GITHUB_BRANCH}/cache/prices.parquet"
+)
+GITHUB_META_LFS = (
+    f"https://media.githubusercontent.com/media/{GITHUB_USER}/{GITHUB_REPO}/"
+    f"{GITHUB_BRANCH}/cache/meta.parquet"
+)
 
 BATCH_SIZE    = 50
 SLEEP_BETWEEN = 0.4
@@ -153,17 +181,50 @@ def download_prices(tickers, pbar, status):
     return prices.sort_index().dropna(how="all")
 
 
+def _read_parquet_url(url: str) -> pd.DataFrame:
+    """Download a parquet file from a URL and read into a DataFrame."""
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
+    return pd.read_parquet(io.BytesIO(r.content))
+
+
+@st.cache_data(show_spinner="Loading price data…", ttl=24 * 3600)
 def load_cached():
+    """
+    Try local cache first, then fall back to GitHub raw URL,
+    then to Git LFS media URL. Returns (prices, meta) or (None, None).
+    """
+    # 1) Local files (fastest path)
     try:
         if os.path.exists(PRICES_FILE) and os.path.exists(META_FILE):
             return pd.read_parquet(PRICES_FILE), pd.read_parquet(META_FILE)
-    except Exception:
-        pass
+    except Exception as e:
+        st.warning(f"Local cache unreadable ({e}). Trying GitHub…")
+
+    # 2) GitHub raw (works for files < 100 MB committed normally)
+    for prices_url, meta_url, label in [
+        (GITHUB_PRICES_URL, GITHUB_META_URL, "GitHub raw"),
+        (GITHUB_PRICES_LFS, GITHUB_META_LFS, "Git LFS"),
+    ]:
+        try:
+            prices = _read_parquet_url(prices_url)
+            meta   = _read_parquet_url(meta_url)
+            # Save locally so next reload is instant
+            try:
+                prices.to_parquet(PRICES_FILE)
+                meta.to_parquet(META_FILE)
+            except Exception:
+                pass
+            st.toast(f"Loaded data from {label}", icon="✅")
+            return prices, meta
+        except Exception:
+            continue
+
     return None, None
 
 
 def fetch_all():
-    """Download the full universe."""
+    """Download the full universe from Yahoo Finance."""
     status = st.empty()
     pbar   = st.progress(0.0)
     status.text("Fetching ticker list…")
@@ -172,10 +233,17 @@ def fetch_all():
     prices = download_prices(universe["Ticker"].tolist(), pbar, status)
     meta = universe[universe["Ticker"].isin(prices.columns)].reset_index(drop=True)
     try:
-        prices.to_parquet(PRICES_FILE)
-        meta.to_parquet(META_FILE)
+        # Shrink size: float32 + zstd compression
+        prices.astype("float32").to_parquet(PRICES_FILE, compression="zstd")
+        meta.to_parquet(META_FILE, compression="zstd")
+        st.toast("Saved cache/*.parquet — commit & push to GitHub!", icon="💾")
     except Exception:
-        pass
+        # Fallback to default parquet if zstd not available
+        try:
+            prices.to_parquet(PRICES_FILE)
+            meta.to_parquet(META_FILE)
+        except Exception:
+            pass
     pbar.empty(); status.empty()
     return prices, meta
 
@@ -240,11 +308,14 @@ meta   = st.session_state.meta
 if prices is None:
     st.title("🚀 US Stocks — Multibaggers")
     st.warning(
-        "**Heads-up:** downloading the full US-listed universe "
-        "(~5000-6000 stocks) takes 30-60 minutes and may hit Yahoo Finance "
-        "rate limits — especially on Streamlit Cloud free tier. "
-        "Recommended: run locally and copy `cache/prices.parquet` and "
-        "`cache/meta.parquet` to your deployed repo."
+        "**No cached data found.** Tried local `cache/` folder and the "
+        f"GitHub repo `{GITHUB_USER}/{GITHUB_REPO}` (`{GITHUB_BRANCH}` branch) "
+        "— neither had the parquet files.\n\n"
+        "You can download fresh data from Yahoo Finance below "
+        "(~30-60 minutes for the full universe of 5000-6000 stocks). "
+        "After it finishes, the files are saved to `cache/prices.parquet` and "
+        "`cache/meta.parquet` — commit & push them to GitHub so the cloud "
+        "deploy loads instantly next time."
     )
     if st.sidebar.button("⬇️ Download ALL US stocks", type="primary"):
         try:
@@ -262,11 +333,19 @@ st.sidebar.success(
     f"✓ {prices.shape[1]} tickers · {prices.shape[0]:,} days\n\n"
     f"Last: {prices.index.max().strftime('%Y-%m-%d')}"
 )
-if st.sidebar.button("🔄 Re-download"):
+if st.sidebar.button("🔄 Re-download from Yahoo"):
     st.session_state.prices = None
     st.session_state.meta   = None
     st.cache_data.clear()
     st.rerun()
+
+with st.sidebar.expander("ℹ️ Data source"):
+    st.markdown(
+        f"- **Repo:** [{GITHUB_USER}/{GITHUB_REPO}]"
+        f"(https://github.com/{GITHUB_USER}/{GITHUB_REPO})\n"
+        f"- **Branch:** `{GITHUB_BRANCH}`\n"
+        f"- Load order: local → GitHub raw → Git LFS → manual download"
+    )
 
 # ---------------------------------------------------------------------------
 # SUMMARY + FILTERS
