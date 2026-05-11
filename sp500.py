@@ -536,16 +536,10 @@ st.caption(f"{prices.shape[1]} stocks · 10y daily prices from Yahoo Finance · 
            "Data-quality filtered")
 
 # Top summary metrics
-c1, c2, c3, c4 = st.columns(4)
+c1, c2 = st.columns(2)
 c1.metric("Stocks in view", f"{len(view):,}")
 c2.metric("Multibaggers (10×+)", f"{int(view['Multibagger'].sum()):,}",
           f"{view['Multibagger'].mean() * 100:.1f}%" if len(view) else "—")
-c3.metric("Median 1Y return",
-          f"{view['Median 1Y Return'].median() * 100:.2f}%"
-          if view['Median 1Y Return'].notna().any() else "—")
-c4.metric("Median 3Y CAGR",
-          f"{view['Median 3Y CAGR'].median() * 100:.2f}%"
-          if view['Median 3Y CAGR'].notna().any() else "—")
 
 st.divider()
 
@@ -554,7 +548,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 mb = view[view["Multibagger"]].sort_values("Multiple (x)", ascending=False)
 if not mb.empty:
-    st.subheader(f"🚀 Top multibaggers ({len(mb)} found, data-quality verified)")
+    st.subheader(f"🚀 Top multibaggers ({len(mb)} found)")
     top_n = min(30, len(mb))
     fig = px.bar(mb.head(top_n), x="Multiple (x)", y="Ticker",
                  orientation="h",
