@@ -485,36 +485,13 @@ with st.sidebar.expander("🔄 Re-download data"):
             st.error(f"Failed: {e}")
             st.stop()
 
-with st.sidebar.expander("ℹ️ Data source"):
-    st.markdown(
-        f"- **Repo:** [{GITHUB_USER}/{GITHUB_REPO}]"
-        f"(https://github.com/{GITHUB_USER}/{GITHUB_REPO})\n"
-        f"- **Branch:** `{GITHUB_BRANCH}`\n"
-        f"- Load order: local → GitHub raw → Git LFS → manual download"
-    )
-
 # ---------------------------------------------------------------------------
 # SUMMARY + FILTERS
 # ---------------------------------------------------------------------------
 summary = build_summary(prices, meta)
 
-st.sidebar.divider()
-st.sidebar.subheader("🧹 Data quality")
-hide_bad_quality = st.sidebar.checkbox(
-    "Hide bad-quality stocks",
-    value=True,
-    help="Hides stocks with sub-$1 starting prices, reverse-split artifacts, "
-         "insufficient history, or absurd multiples."
-)
-
-with st.sidebar.expander("Advanced quality settings"):
-    st.caption(
-        f"**Filters applied:**\n"
-        f"- ≥ {MIN_TRADING_DAYS} trading days\n"
-        f"- Multiple ≤ {int(MAX_REASONABLE_MULT)}×\n"
-        f"- No single-day jump > {int(MAX_SINGLE_DAY_JUMP*100)}%\n"
-        f"- Uses 21-day median for first/last price"
-    )
+# Data-quality filter is always on (hidden from UI)
+hide_bad_quality = True
 
 st.sidebar.divider()
 multibagger_only = st.sidebar.checkbox(f"🚀 Multibaggers only (≥{MULTIBAGGER_X:.0f}×)")
