@@ -45,7 +45,6 @@ W_3Y          = 756
 MULTIBAGGER_X = 10.0
 
 # Data-quality thresholds
-MIN_START_PRICE      = 1.00   # ignore sub-$1 starting prices (penny/split artifacts)
 SMOOTH_WINDOW        = 21     # use 21-day median for "first" and "last" prices
 MIN_TRADING_DAYS     = 252    # need at least 1 year of real data
 MAX_REASONABLE_MULT  = 1000.0 # cap absurd multiples (data error sentinel)
@@ -224,11 +223,20 @@ def fetch_all(limit=None):
     pbar   = st.progress(0.0)
     status.text("Fetching ticker list…")
     universe = get_us_tickers()
-    if limit is not None and limit < len(universe):
-        universe = universe.head(limit).reset_index(drop=True)
-        status.text(f"Universe limited to {len(universe)} tickers · downloading…")
+    total_available = len(universe)
+
+    if limit is not None and limit < total_available:
+        universe = universe.head(int(limit)).reset_index(drop=True)
+        st.info(
+            f"📋 Universe size: **{total_available}** tickers available · "
+            f"downloading first **{len(universe)}** "
+            f"(alphabetical: {universe['Ticker'].iloc[0]} → "
+            f"{universe['Ticker'].iloc[-1]})"
+        )
     else:
-        status.text(f"Universe size: {len(universe)} tickers · downloading…")
+        st.info(f"📋 Downloading FULL universe: **{total_available}** tickers")
+
+    status.text(f"Downloading {len(universe)} tickers…")
     prices = download_prices(universe["Ticker"].tolist(), pbar, status)
     meta = universe[universe["Ticker"].isin(prices.columns)].reset_index(drop=True)
     try:
@@ -305,7 +313,6 @@ def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
     years    = (eps["Last Date"] - eps["First Date"]).dt.days / 365.25
 
     # ---- DATA-QUALITY FLAGS ----
-    too_cheap_start = eps["First Price"].fillna(0) < MIN_START_PRICE
     too_short       = years.fillna(0) < (MIN_TRADING_DAYS / 252)
     absurd_multiple = multiple.fillna(0) > MAX_REASONABLE_MULT
     no_data         = eps["First Price"].isna() | eps["Last Price"].isna()
@@ -313,7 +320,7 @@ def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
     suspicious_jump = _detect_suspicious_jumps(prices)
     suspicious_jump = suspicious_jump.reindex(eps.index).fillna(False)
 
-    quality_bad = (too_cheap_start | too_short | absurd_multiple |
+    quality_bad = (too_short | absurd_multiple |
                    no_data | suspicious_jump)
 
     # Per-flag reasons for transparency
@@ -322,7 +329,6 @@ def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
         rs = []
         if no_data.loc[t]:                  rs.append("no data")
         if too_short.loc[t]:                rs.append("<1y history")
-        if too_cheap_start.loc[t]:          rs.append(f"start <${MIN_START_PRICE:.0f}")
         if absurd_multiple.loc[t]:          rs.append(f">{int(MAX_REASONABLE_MULT)}x mult")
         if suspicious_jump.loc[t]:          rs.append("split artifact")
         reasons.append(", ".join(rs) if rs else "")
@@ -406,11 +412,20 @@ if prices is None:
     )
 
     if st.sidebar.button("⬇️ Start download", type="primary"):
+        # Ensure no stale cache files exist
+        for f in (PRICES_FILE, META_FILE):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
+        st.cache_data.clear()
         try:
-            with st.spinner("Downloading…"):
+            with st.spinner(f"Downloading {n_stocks or '~6000'} stocks…"):
                 p, m = fetch_all(limit=n_stocks)
             st.session_state.prices = p
             st.session_state.meta   = m
+            st.success(f"✓ Downloaded {p.shape[1]} stocks")
             st.rerun()
         except Exception as e:
             st.error(f"Failed: {e}")
@@ -442,15 +457,29 @@ with st.sidebar.expander("🔄 Re-download data"):
     else:
         redl_n = redl_map[redl_mode]
 
-    if st.button("⬇️ Start re-download", type="primary"):
+    st.caption(f"⏱️ ETA: ~{(redl_n or 6000) / 100:.0f} min")
+    st.caption("⚠️ This will DELETE the existing cache and re-download.")
+
+    if st.button("⬇️ Start re-download", type="primary", key="btn_redl"):
+        # 1. Delete local cache files so we don't fall back to them
+        for f in (PRICES_FILE, META_FILE):
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
+        # 2. Clear ALL streamlit caches (load_cached + get_us_tickers + compute_rolling)
+        st.cache_data.clear()
+        # 3. Clear session state so load_cached() won't be re-used
         st.session_state.prices = None
         st.session_state.meta   = None
-        st.cache_data.clear()
+        # 4. Directly download with the chosen limit (don't call load_cached)
         try:
-            with st.spinner("Downloading…"):
+            with st.spinner(f"Downloading {redl_n or '~6000'} stocks…"):
                 p, m = fetch_all(limit=redl_n)
             st.session_state.prices = p
             st.session_state.meta   = m
+            st.success(f"✓ Downloaded {p.shape[1]} stocks")
             st.rerun()
         except Exception as e:
             st.error(f"Failed: {e}")
@@ -481,7 +510,6 @@ hide_bad_quality = st.sidebar.checkbox(
 with st.sidebar.expander("Advanced quality settings"):
     st.caption(
         f"**Filters applied:**\n"
-        f"- Start price ≥ ${MIN_START_PRICE:.2f}\n"
         f"- ≥ {MIN_TRADING_DAYS} trading days\n"
         f"- Multiple ≤ {int(MAX_REASONABLE_MULT)}×\n"
         f"- No single-day jump > {int(MAX_SINGLE_DAY_JUMP*100)}%\n"
@@ -508,7 +536,7 @@ st.caption(f"{prices.shape[1]} stocks · 10y daily prices from Yahoo Finance · 
            "Data-quality filtered")
 
 # Top summary metrics
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Stocks in view", f"{len(view):,}")
 c2.metric("Multibaggers (10×+)", f"{int(view['Multibagger'].sum()):,}",
           f"{view['Multibagger'].mean() * 100:.1f}%" if len(view) else "—")
@@ -518,10 +546,6 @@ c3.metric("Median 1Y return",
 c4.metric("Median 3Y CAGR",
           f"{view['Median 3Y CAGR'].median() * 100:.2f}%"
           if view['Median 3Y CAGR'].notna().any() else "—")
-n_filtered_out = int((~summary["Data Quality OK"]).sum())
-c5.metric("Filtered out (bad data)", f"{n_filtered_out:,}",
-          f"{n_filtered_out / len(summary) * 100:.1f}%" if len(summary) else "—",
-          delta_color="off")
 
 st.divider()
 
@@ -541,26 +565,6 @@ if not mb.empty:
                       yaxis={'categoryorder': 'total ascending'},
                       margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# FILTERED-OUT INSPECTION (transparency)
-# ---------------------------------------------------------------------------
-with st.expander(f"🔍 Inspect filtered-out stocks ({n_filtered_out:,} hidden)"):
-    st.caption("These stocks were excluded due to data-quality issues. "
-               "Common reasons: reverse-split artifacts, sub-$1 starting prices, "
-               "insufficient history, or absurd multiples (likely bad data).")
-    bad = summary[~summary["Data Quality OK"]].copy()
-    bad = bad.sort_values("Multiple (x)", ascending=False)
-    bad_display = bad[["Ticker", "Company", "Quality Issues", "Multiple (x)",
-                       "First Price", "Last Price", "Years of Data"]]
-    st.dataframe(bad_display, use_container_width=True, height=400,
-                 column_config={
-                     "Multiple (x)": st.column_config.NumberColumn(format="%.2f×"),
-                     "First Price":  st.column_config.NumberColumn(format="$%.2f"),
-                     "Last Price":   st.column_config.NumberColumn(format="$%.2f"),
-                 })
 
 st.divider()
 
