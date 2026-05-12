@@ -294,6 +294,53 @@ def _detect_suspicious_jumps(prices: pd.DataFrame) -> pd.Series:
     return max_jump > MAX_SINGLE_DAY_JUMP
 
 
+@st.cache_data(show_spinner="Scanning rolling windows for multibaggers…")
+def find_window_multibaggers(prices: pd.DataFrame, window_years: int,
+                             threshold: float = MULTIBAGGER_X) -> pd.DataFrame:
+    """
+    For each stock, find the BEST rolling window of `window_years` length
+    where it returned >= `threshold`× (e.g. 10×).
+
+    Returns a DataFrame with one row per stock that ever hit threshold
+    in any rolling window of that length, including:
+        - Best Multiple, Best Start Date, Best End Date
+        - Best CAGR
+    """
+    window_days = int(window_years * 252)  # ~252 trading days/year
+    safe = prices.where(prices > 0)
+
+    # Ratio of price today vs price `window_days` ago, per stock per day
+    ratio = safe / safe.shift(window_days)
+
+    records = []
+    for t in ratio.columns:
+        col = ratio[t].dropna()
+        if col.empty:
+            continue
+        max_mult = col.max()
+        if pd.isna(max_mult) or max_mult < threshold:
+            continue
+        # Find the date where the best multiple was achieved
+        end_dt   = col.idxmax()
+        end_loc  = safe.index.get_loc(end_dt)
+        start_loc = max(0, end_loc - window_days)
+        start_dt = safe.index[start_loc]
+        cagr = max_mult ** (1.0 / window_years) - 1.0
+        records.append({
+            "Ticker":          t,
+            "Best Multiple":   round(float(max_mult), 2),
+            "Best Start Date": start_dt,
+            "Best End Date":   end_dt,
+            "Best CAGR":       round(float(cagr), 4),
+        })
+
+    if not records:
+        return pd.DataFrame(columns=["Ticker", "Best Multiple",
+                                     "Best Start Date", "Best End Date",
+                                     "Best CAGR"])
+    return pd.DataFrame(records).sort_values("Best Multiple", ascending=False)
+
+
 @st.cache_data(show_spinner=False)
 def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
     r1 = compute_rolling(prices, W_1Y, 1.0)
@@ -497,6 +544,17 @@ st.sidebar.divider()
 multibagger_only = st.sidebar.checkbox(f"🚀 Multibaggers only (≥{MULTIBAGGER_X:.0f}×)")
 min_years = st.sidebar.slider("Min years of history", 1, 10, 3)
 
+st.sidebar.divider()
+st.sidebar.subheader("🔍 Window-scan multibaggers")
+st.sidebar.caption(
+    "Finds stocks that gave 10×+ in ANY rolling N-year window "
+    "(even if they later crashed)."
+)
+window_years = st.sidebar.slider(
+    "Window length (years)", min_value=1, max_value=10, value=3, step=1,
+    help="e.g. 3 = find stocks that 10×'d in any 3-year period like 2021→2024"
+)
+
 view = summary.copy()
 if hide_bad_quality:
     view = view[view["Data Quality OK"]]
@@ -536,6 +594,82 @@ if not mb.empty:
                       yaxis={'categoryorder': 'total ascending'},
                       margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# WINDOW-SCAN MULTIBAGGERS (any N-year period where stock hit 10×)
+# ---------------------------------------------------------------------------
+st.subheader(f"🔍 Stocks that gave 10×+ in any {window_years}-year window")
+st.caption(
+    f"Scans every rolling {window_years}-year window in the data and flags "
+    "stocks that became multibaggers in ANY of them — even if they later "
+    "gave back the gains. Shows the BEST window per stock."
+)
+
+# Only scan stocks that passed quality filter
+quality_ok_prices = prices[summary[summary["Data Quality OK"]]["Ticker"].tolist()]
+window_mb = find_window_multibaggers(quality_ok_prices, window_years, MULTIBAGGER_X)
+
+if window_mb.empty:
+    st.info(f"No stocks reached 10×+ in any {window_years}-year window.")
+else:
+    # Merge company names
+    window_mb = window_mb.merge(meta[["Ticker", "Company"]], on="Ticker", how="left")
+    window_mb = window_mb[["Ticker", "Company", "Best Multiple",
+                           "Best CAGR", "Best Start Date", "Best End Date"]]
+
+    # Summary metric
+    mc1, mc2 = st.columns(2)
+    mc1.metric(f"{window_years}-year multibaggers found", f"{len(window_mb):,}")
+    mc2.metric("Highest multiple",
+               f"{window_mb['Best Multiple'].iloc[0]:.1f}×",
+               window_mb["Ticker"].iloc[0])
+
+    # Top 30 bar chart
+    top_n = min(30, len(window_mb))
+    fig_w = px.bar(
+        window_mb.head(top_n),
+        x="Best Multiple", y="Ticker", orientation="h",
+        hover_data={
+            "Company":         True,
+            "Best Multiple":   ":.2f",
+            "Best CAGR":       ":.1%",
+            "Best Start Date": "|%b %Y",
+            "Best End Date":   "|%b %Y",
+        },
+        color="Best Multiple", color_continuous_scale="Viridis",
+        title=f"Top {top_n} {window_years}-year window multibaggers",
+    )
+    fig_w.update_layout(height=max(400, 22 * top_n),
+                        yaxis={"categoryorder": "total ascending"},
+                        margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig_w, use_container_width=True)
+
+    # Full table for window multibaggers
+    st.write(f"**All {len(window_mb)} {window_years}-year multibaggers:**")
+    table_w = window_mb.copy()
+    table_w["Best CAGR (%)"] = (table_w["Best CAGR"] * 100).round(1)
+    table_w["Best Start Date"] = pd.to_datetime(table_w["Best Start Date"]).dt.strftime("%Y-%m-%d")
+    table_w["Best End Date"]   = pd.to_datetime(table_w["Best End Date"]).dt.strftime("%Y-%m-%d")
+    table_w = table_w[["Ticker", "Company", "Best Multiple", "Best CAGR (%)",
+                       "Best Start Date", "Best End Date"]]
+
+    st.dataframe(
+        table_w, use_container_width=True, height=400,
+        column_config={
+            "Best Multiple":   st.column_config.NumberColumn(format="%.2f×"),
+            "Best CAGR (%)":   st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
+
+    st.download_button(
+        f"📥 Download {window_years}-year window multibaggers as CSV",
+        data=window_mb.to_csv(index=False).encode(),
+        file_name=f"us_stocks_{window_years}y_window_multibaggers.csv",
+        mime="text/csv",
+        key="dl_window",
+    )
 
 st.divider()
 
