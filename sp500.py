@@ -1,29 +1,30 @@
 """
-US Stocks Multibagger Dashboard
-================================
-For every US stock (full Russell 3000-style universe):
-  - Multibagger flag (10x+ total return) WITH data-quality filtering
-  - Median 1-year rolling return
-  - Median 3-year rolling CAGR
-  - Per-stock rolling returns chart on demand
+US Stocks Multibagger Dashboard — v2 (simplified UI)
+=====================================================
+Find ANY stock that gave X× return in a rolling window of your choice.
 
-DATA-QUALITY FIXES (prevents false multibaggers):
-  - Robust endpoints: uses 21-day median, not single-day prints
-  - Filters sub-$1 starting prices (reverse-split / penny-stock artifacts)
-  - Detects suspicious single-day jumps > 400% (split artifacts)
+UI: Pick a threshold (5×/10×/20×/etc) and a window length (1y/2y/3y/...),
+    optionally filter by historical period. See results.
+
+DATA-QUALITY FILTERING:
+  - Robust endpoints (21-day median)
+  - Filters split artifacts (>400% single-day jumps)
   - Caps absurd multiples > 1000x as data errors
-  - Requires minimum trading-day history
 
-Setup:
-    pip install streamlit yfinance pandas numpy plotly requests pyarrow
+LOADING FIXES:
+  - load_cached() is NOT cached (so retries actually retry)
+  - 60s HTTP timeout on GitHub fetches
+  - Cache diagnostics panel in sidebar
+  - Force-clear button
 
-Run:
-    streamlit run app.py
+Setup:  pip install streamlit yfinance pandas numpy plotly requests pyarrow
+Run:    streamlit run app.py
 """
 
 import os
 import io
 import time
+import traceback
 from datetime import datetime
 
 import numpy as np
@@ -32,6 +33,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 import plotly.express as px
+import plotly.graph_objects as go
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -40,15 +42,12 @@ st.set_page_config(page_title="US Stocks — Multibaggers",
                    page_icon="🚀", layout="wide")
 
 YEARS_BACK    = 10
-W_1Y          = 252
-W_3Y          = 756
-MULTIBAGGER_X = 10.0
 
 # Data-quality thresholds
-SMOOTH_WINDOW        = 21     # use 21-day median for "first" and "last" prices
-MIN_TRADING_DAYS     = 252    # need at least 1 year of real data
-MAX_REASONABLE_MULT  = 1000.0 # cap absurd multiples (data error sentinel)
-MAX_SINGLE_DAY_JUMP  = 4.0    # 400% single-day = almost certainly bad data
+SMOOTH_WINDOW        = 21
+MIN_TRADING_DAYS     = 252
+MAX_REASONABLE_MULT  = 1000.0
+MAX_SINGLE_DAY_JUMP  = 4.0
 
 CACHE_DIR     = "cache"
 PRICES_FILE   = os.path.join(CACHE_DIR, "prices.parquet")
@@ -76,6 +75,7 @@ GITHUB_META_LFS = (
 
 BATCH_SIZE    = 50
 SLEEP_BETWEEN = 0.4
+HTTP_TIMEOUT  = 60
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -85,7 +85,6 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def get_us_tickers() -> pd.DataFrame:
-    """All NYSE + NASDAQ common stocks (excludes ETFs, warrants, units)."""
     headers = {"User-Agent": "Mozilla/5.0"}
 
     def _fetch(url):
@@ -182,26 +181,31 @@ def download_prices(tickers, pbar, status):
 
 
 def _read_parquet_url(url: str) -> pd.DataFrame:
-    """Download a parquet file from a URL and read into a DataFrame."""
-    r = requests.get(url, timeout=120)
+    r = requests.get(url, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return pd.read_parquet(io.BytesIO(r.content))
 
 
-@st.cache_data(show_spinner="Loading price data…", ttl=24 * 3600)
-def load_cached():
-    """Try local cache first, then GitHub raw, then Git LFS."""
+def load_cached(verbose: bool = True):
+    """NOT @st.cache_data on purpose — otherwise a hung first call sticks forever."""
     try:
         if os.path.exists(PRICES_FILE) and os.path.exists(META_FILE):
-            return pd.read_parquet(PRICES_FILE), pd.read_parquet(META_FILE)
+            p = pd.read_parquet(PRICES_FILE)
+            m = pd.read_parquet(META_FILE)
+            if verbose:
+                st.toast(f"Loaded from local cache: {p.shape[1]} tickers", icon="✅")
+            return p, m
     except Exception as e:
-        st.warning(f"Local cache unreadable ({e}). Trying GitHub…")
+        if verbose:
+            st.warning(f"Local cache unreadable ({e}). Trying GitHub…")
 
     for prices_url, meta_url, label in [
         (GITHUB_PRICES_URL, GITHUB_META_URL, "GitHub raw"),
         (GITHUB_PRICES_LFS, GITHUB_META_LFS, "Git LFS"),
     ]:
         try:
+            if verbose:
+                st.info(f"Fetching from {label}… (timeout={HTTP_TIMEOUT}s)")
             prices = _read_parquet_url(prices_url)
             meta   = _read_parquet_url(meta_url)
             try:
@@ -209,16 +213,18 @@ def load_cached():
                 meta.to_parquet(META_FILE)
             except Exception:
                 pass
-            st.toast(f"Loaded data from {label}", icon="✅")
+            if verbose:
+                st.toast(f"Loaded data from {label}: {prices.shape[1]} tickers", icon="✅")
             return prices, meta
-        except Exception:
+        except Exception as e:
+            if verbose:
+                st.warning(f"{label} failed: {type(e).__name__}: {e}")
             continue
 
     return None, None
 
 
 def fetch_all(limit=None):
-    """Download from Yahoo Finance. limit=None means full universe."""
     status = st.empty()
     pbar   = st.progress(0.0)
     status.text("Fetching ticker list…")
@@ -254,64 +260,41 @@ def fetch_all(limit=None):
 
 
 # ---------------------------------------------------------------------------
-# CALCULATIONS (with data-quality fixes)
+# CALCULATIONS
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def compute_rolling(prices: pd.DataFrame, window: int, years: float) -> pd.DataFrame:
-    """Daily annualised rolling CAGR over `window` trading days."""
-    # Mask non-positive prices to avoid garbage rolling returns
-    safe = prices.where(prices > 0)
-    return ((safe / safe.shift(window)).pow(1.0 / years) - 1.0)
-
-
-def _robust_endpoints(s: pd.Series, window: int = SMOOTH_WINDOW):
-    """
-    Return (first_date, first_price, last_date, last_price) using a
-    rolling-median smoothing on both ends to kill single-print artifacts.
-    """
-    s = s.dropna()
-    s = s[s > 0]  # drop zeros / negatives
-    if len(s) < max(window * 2, MIN_TRADING_DAYS):
-        return (pd.NaT, np.nan, pd.NaT, np.nan)
-
-    first_window = s.iloc[:window]
-    last_window  = s.iloc[-window:]
-    first_px = float(first_window.median())
-    last_px  = float(last_window.median())
-    first_dt = first_window.index[0]
-    last_dt  = last_window.index[-1]
-    return (first_dt, first_px, last_dt, last_px)
-
-
 def _detect_suspicious_jumps(prices: pd.DataFrame) -> pd.Series:
-    """
-    Detect tickers with single-day moves > MAX_SINGLE_DAY_JUMP (400%).
-    These are almost always reverse-split artifacts or bad data, not real returns.
-    """
     safe = prices.where(prices > 0)
-    daily_ret = safe.pct_change()
-    max_jump  = daily_ret.abs().max()
-    return max_jump > MAX_SINGLE_DAY_JUMP
+    return safe.pct_change().abs().max() > MAX_SINGLE_DAY_JUMP
+
+
+@st.cache_data(show_spinner=False)
+def build_quality_mask(prices: pd.DataFrame) -> pd.Series:
+    """Series indexed by ticker; True if data quality OK."""
+    suspicious = _detect_suspicious_jumps(prices)
+    valid = []
+    for t in prices.columns:
+        s = prices[t].dropna()
+        s = s[s > 0]
+        valid.append(len(s) >= MIN_TRADING_DAYS)
+    valid_s = pd.Series(valid, index=prices.columns)
+    return valid_s & ~suspicious.reindex(prices.columns).fillna(False)
 
 
 @st.cache_data(show_spinner="Scanning rolling windows for multibaggers…")
-def find_window_multibaggers(prices: pd.DataFrame, window_years: int,
-                             threshold: float = MULTIBAGGER_X) -> pd.DataFrame:
+def find_window_multibaggers(prices: pd.DataFrame, window_years: float,
+                             threshold: float) -> pd.DataFrame:
     """
-    For each stock, find the BEST rolling window of `window_years` length
-    where it returned >= `threshold`× (e.g. 10×).
-
-    Returns a DataFrame with one row per stock that ever hit threshold
-    in any rolling window of that length, including:
-        - Best Multiple, Best Start Date, Best End Date
-        - Best CAGR
+    For each stock, find the BEST rolling window of length `window_years`
+    where it returned >= threshold×. Returns one row per qualifying stock.
     """
-    window_days = int(window_years * 252)  # ~252 trading days/year
+    window_days = max(21, int(window_years * 252))  # min ~1 month
     safe = prices.where(prices > 0)
 
-    # Ratio of price today vs price `window_days` ago, per stock per day
-    ratio = safe / safe.shift(window_days)
+    if window_days >= len(safe):
+        return pd.DataFrame(columns=["Ticker", "Best Multiple", "Best CAGR",
+                                     "Start Date", "End Date"])
 
+    ratio = safe / safe.shift(window_days)
     records = []
     for t in ratio.columns:
         col = ratio[t].dropna()
@@ -320,89 +303,29 @@ def find_window_multibaggers(prices: pd.DataFrame, window_years: int,
         max_mult = col.max()
         if pd.isna(max_mult) or max_mult < threshold:
             continue
-        # Find the date where the best multiple was achieved
-        end_dt   = col.idxmax()
-        end_loc  = safe.index.get_loc(end_dt)
+        if max_mult > MAX_REASONABLE_MULT:
+            continue
+        end_dt = col.idxmax()
+        try:
+            end_loc = safe.index.get_loc(end_dt)
+        except KeyError:
+            continue
         start_loc = max(0, end_loc - window_days)
         start_dt = safe.index[start_loc]
-        cagr = max_mult ** (1.0 / window_years) - 1.0
+        cagr = max_mult ** (1.0 / max(window_years, 0.01)) - 1.0
         records.append({
-            "Ticker":          t,
-            "Best Multiple":   round(float(max_mult), 2),
-            "Best Start Date": start_dt,
-            "Best End Date":   end_dt,
-            "Best CAGR":       round(float(cagr), 4),
+            "Ticker":        t,
+            "Best Multiple": round(float(max_mult), 2),
+            "Best CAGR":     round(float(cagr), 4),
+            "Start Date":    start_dt,
+            "End Date":      end_dt,
         })
 
     if not records:
-        return pd.DataFrame(columns=["Ticker", "Best Multiple",
-                                     "Best Start Date", "Best End Date",
-                                     "Best CAGR"])
-    return pd.DataFrame(records).sort_values("Best Multiple", ascending=False)
-
-
-@st.cache_data(show_spinner=False)
-def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
-    r1 = compute_rolling(prices, W_1Y, 1.0)
-    r3 = compute_rolling(prices, W_3Y, 3.0)
-
-    # Robust endpoints (21-day median, not single prints)
-    records = []
-    for t in prices.columns:
-        first_dt, first_px, last_dt, last_px = _robust_endpoints(prices[t])
-        records.append((t, first_dt, first_px, last_dt, last_px))
-
-    eps = pd.DataFrame(records, columns=["Ticker", "First Date", "First Price",
-                                         "Last Date", "Last Price"])
-    eps = eps.set_index("Ticker")
-
-    multiple = eps["Last Price"] / eps["First Price"]
-    years    = (eps["Last Date"] - eps["First Date"]).dt.days / 365.25
-
-    # ---- DATA-QUALITY FLAGS ----
-    too_short       = years.fillna(0) < (MIN_TRADING_DAYS / 252)
-    absurd_multiple = multiple.fillna(0) > MAX_REASONABLE_MULT
-    no_data         = eps["First Price"].isna() | eps["Last Price"].isna()
-
-    suspicious_jump = _detect_suspicious_jumps(prices)
-    suspicious_jump = suspicious_jump.reindex(eps.index).fillna(False)
-
-    quality_bad = (too_short | absurd_multiple |
-                   no_data | suspicious_jump)
-
-    # Per-flag reasons for transparency
-    reasons = []
-    for t in eps.index:
-        rs = []
-        if no_data.loc[t]:                  rs.append("no data")
-        if too_short.loc[t]:                rs.append("<1y history")
-        if absurd_multiple.loc[t]:          rs.append(f">{int(MAX_REASONABLE_MULT)}x mult")
-        if suspicious_jump.loc[t]:          rs.append("split artifact")
-        reasons.append(", ".join(rs) if rs else "")
-
-    df = pd.DataFrame({
-        "First Date":       eps["First Date"],
-        "Last Date":        eps["Last Date"],
-        "Years of Data":    years.round(1),
-        "First Price":      eps["First Price"].round(2),
-        "Last Price":       eps["Last Price"].round(2),
-        "Multiple (x)":     multiple.round(2),
-        "Median 1Y Return": r1.median().round(4),
-        "Median 3Y CAGR":   r3.median().round(4),
-        "Data Quality OK":  ~quality_bad,
-        "Quality Issues":   reasons,
-    })
-    df.index.name = "Ticker"
-    df = df.reset_index().merge(meta, on="Ticker", how="left")
-
-    # Multibagger ONLY if data quality is OK
-    df["Multibagger"] = (df["Multiple (x)"] >= MULTIBAGGER_X) & df["Data Quality OK"]
-
-    return df[["Ticker", "Company", "Multibagger", "Multiple (x)",
-               "Median 1Y Return", "Median 3Y CAGR",
-               "Years of Data", "First Date", "Last Date",
-               "First Price", "Last Price",
-               "Data Quality OK", "Quality Issues"]]
+        return pd.DataFrame(columns=["Ticker", "Best Multiple", "Best CAGR",
+                                     "Start Date", "End Date"])
+    return pd.DataFrame(records).sort_values("Best Multiple",
+                                             ascending=False).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -410,8 +333,32 @@ def build_summary(prices: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Controls")
 
-if "prices" not in st.session_state:
-    p, m = load_cached()
+with st.sidebar.expander("🔧 Cache diagnostics"):
+    st.caption(f"Working dir: `{os.getcwd()}`")
+    if os.path.exists(PRICES_FILE):
+        sz = os.path.getsize(PRICES_FILE) / 1024 / 1024
+        st.success(f"✓ prices.parquet ({sz:.1f} MB)")
+    else:
+        st.warning("✗ prices.parquet not found")
+    if os.path.exists(META_FILE):
+        st.success("✓ meta.parquet")
+    else:
+        st.warning("✗ meta.parquet not found")
+    if st.button("🗑️ Clear local cache files"):
+        for f in (PRICES_FILE, META_FILE):
+            try:
+                if os.path.exists(f): os.remove(f)
+            except Exception as e:
+                st.error(f"Couldn't delete {f}: {e}")
+        st.cache_data.clear()
+        st.session_state.pop("prices", None)
+        st.session_state.pop("meta", None)
+        st.success("Cleared. Rerun to reload.")
+        st.rerun()
+
+if "prices" not in st.session_state or st.session_state.get("prices") is None:
+    with st.spinner("Loading price data…"):
+        p, m = load_cached()
     st.session_state.prices = p
     st.session_state.meta   = m
 
@@ -422,10 +369,8 @@ if prices is None:
     st.title("🚀 US Stocks — Multibaggers")
     st.warning(
         "**No cached data found.** Tried local `cache/` folder and the "
-        f"GitHub repo `{GITHUB_USER}/{GITHUB_REPO}` (`{GITHUB_BRANCH}` branch) "
-        "— neither had the parquet files.\n\n"
-        "Download fresh data from Yahoo Finance below. "
-        "You can limit how many stocks to fetch to control download time."
+        f"GitHub repo `{GITHUB_USER}/{GITHUB_REPO}` (`{GITHUB_BRANCH}` branch). "
+        "Download fresh data from Yahoo Finance below."
     )
 
     st.sidebar.subheader("📥 Download settings")
@@ -434,36 +379,26 @@ if prices is None:
         options=["Quick test (100)", "Small (500)", "Medium (1500)",
                  "Large (3000)", "Full universe (~6000)", "Custom"],
         index=2,
-        help="Smaller = faster. Full universe takes 30-60 minutes."
     )
     mode_to_n = {
-        "Quick test (100)":         100,
-        "Small (500)":              500,
-        "Medium (1500)":            1500,
-        "Large (3000)":              3000,
-        "Full universe (~6000)":   None,  # None = all
+        "Quick test (100)": 100, "Small (500)": 500,
+        "Medium (1500)": 1500, "Large (3000)": 3000,
+        "Full universe (~6000)": None,
     }
     if download_mode == "Custom":
-        n_stocks = st.sidebar.number_input(
-            "Number of stocks",
-            min_value=10, max_value=10000, value=1000, step=100,
-            help="Tickers are sampled in alphabetical order."
-        )
+        n_stocks = st.sidebar.number_input("Number of stocks",
+                                           min_value=10, max_value=10000,
+                                           value=1000, step=100)
     else:
         n_stocks = mode_to_n[download_mode]
 
-    eta_minutes = (n_stocks or 6000) / 100  # ~rough estimate: 100 stocks/min
-    st.sidebar.caption(
-        f"⏱️ Estimated time: **~{eta_minutes:.0f} min** "
-        f"({n_stocks or '~6000'} stocks)"
-    )
+    eta_minutes = (n_stocks or 6000) / 100
+    st.sidebar.caption(f"⏱️ ETA: ~{eta_minutes:.0f} min ({n_stocks or '~6000'} stocks)")
 
     if st.sidebar.button("⬇️ Start download", type="primary"):
-        # Ensure no stale cache files exist
         for f in (PRICES_FILE, META_FILE):
             try:
-                if os.path.exists(f):
-                    os.remove(f)
+                if os.path.exists(f): os.remove(f)
             except Exception:
                 pass
         st.cache_data.clear()
@@ -476,6 +411,7 @@ if prices is None:
             st.rerun()
         except Exception as e:
             st.error(f"Failed: {e}")
+            st.code(traceback.format_exc())
             st.stop()
     st.stop()
 
@@ -489,8 +425,7 @@ with st.sidebar.expander("🔄 Re-download data"):
         "How many stocks?",
         options=["Quick test (100)", "Small (500)", "Medium (1500)",
                  "Large (3000)", "Full universe (~6000)", "Custom"],
-        index=2,
-        key="redl_mode",
+        index=2, key="redl_mode",
     )
     redl_map = {
         "Quick test (100)": 100, "Small (500)": 500,
@@ -503,24 +438,17 @@ with st.sidebar.expander("🔄 Re-download data"):
                                  value=1000, step=100, key="redl_n")
     else:
         redl_n = redl_map[redl_mode]
-
     st.caption(f"⏱️ ETA: ~{(redl_n or 6000) / 100:.0f} min")
-    st.caption("⚠️ This will DELETE the existing cache and re-download.")
 
     if st.button("⬇️ Start re-download", type="primary", key="btn_redl"):
-        # 1. Delete local cache files so we don't fall back to them
         for f in (PRICES_FILE, META_FILE):
             try:
-                if os.path.exists(f):
-                    os.remove(f)
+                if os.path.exists(f): os.remove(f)
             except Exception:
                 pass
-        # 2. Clear ALL streamlit caches (load_cached + get_us_tickers + compute_rolling)
         st.cache_data.clear()
-        # 3. Clear session state so load_cached() won't be re-used
         st.session_state.prices = None
         st.session_state.meta   = None
-        # 4. Directly download with the chosen limit (don't call load_cached)
         try:
             with st.spinner(f"Downloading {redl_n or '~6000'} stocks…"):
                 p, m = fetch_all(limit=redl_n)
@@ -530,179 +458,202 @@ with st.sidebar.expander("🔄 Re-download data"):
             st.rerun()
         except Exception as e:
             st.error(f"Failed: {e}")
+            st.code(traceback.format_exc())
             st.stop()
 
 # ---------------------------------------------------------------------------
-# SUMMARY + FILTERS
+# MAIN UI
 # ---------------------------------------------------------------------------
-summary = build_summary(prices, meta)
-
-# Data-quality filter is always on (hidden from UI)
-hide_bad_quality = True
-
-st.sidebar.divider()
-multibagger_only = st.sidebar.checkbox(f"🚀 Multibaggers only (≥{MULTIBAGGER_X:.0f}×)")
-min_years = st.sidebar.slider("Min years of history", 1, 10, 3)
-
-st.sidebar.divider()
-st.sidebar.subheader("🔍 Window-scan multibaggers")
-st.sidebar.caption(
-    "Finds stocks that gave 10×+ in ANY rolling N-year window "
-    "(even if they later crashed)."
-)
-window_years = st.sidebar.slider(
-    "Window length (years)", min_value=1, max_value=10, value=3, step=1,
-    help="e.g. 3 = find stocks that 10×'d in any 3-year period like 2021→2024"
-)
-
-view = summary.copy()
-if hide_bad_quality:
-    view = view[view["Data Quality OK"]]
-view = view[view["Years of Data"].fillna(0) >= min_years]
-if multibagger_only:
-    view = view[view["Multibagger"]]
-
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
-st.title("🚀 US Stocks — Multibaggers")
-st.caption(f"{prices.shape[1]} stocks · 10y daily prices from Yahoo Finance · "
-           f"Multibagger = {MULTIBAGGER_X:.0f}× total return · "
-           "Data-quality filtered")
-
-# Top summary metrics
-c1, c2 = st.columns(2)
-c1.metric("Stocks in view", f"{len(view):,}")
-c2.metric("Multibaggers (10×+)", f"{int(view['Multibagger'].sum()):,}",
-          f"{view['Multibagger'].mean() * 100:.1f}%" if len(view) else "—")
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# TOP MULTIBAGGERS
-# ---------------------------------------------------------------------------
-mb = view[view["Multibagger"]].sort_values("Multiple (x)", ascending=False)
-if not mb.empty:
-    st.subheader(f"🚀 Top multibaggers ({len(mb)} found)")
-    top_n = min(30, len(mb))
-    fig = px.bar(mb.head(top_n), x="Multiple (x)", y="Ticker",
-                 orientation="h",
-                 hover_data={"Company": True, "Multiple (x)": ":.2f",
-                             "Years of Data": True},
-                 color="Multiple (x)", color_continuous_scale="Greens")
-    fig.update_layout(height=max(400, 22 * top_n),
-                      yaxis={'categoryorder': 'total ascending'},
-                      margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# WINDOW-SCAN MULTIBAGGERS (any N-year period where stock hit 10×)
-# ---------------------------------------------------------------------------
-st.subheader(f"🔍 Stocks that gave 10×+ in any {window_years}-year window")
+st.title("🚀 US Stocks — Multibagger Scanner")
 st.caption(
-    f"Scans every rolling {window_years}-year window in the data and flags "
-    "stocks that became multibaggers in ANY of them — even if they later "
-    "gave back the gains. Shows the BEST window per stock."
+    f"{prices.shape[1]} stocks · {prices.shape[0]:,} daily prices from Yahoo Finance · "
+    f"data through {prices.index.max().strftime('%Y-%m-%d')}"
 )
 
-# Only scan stocks that passed quality filter
-quality_ok_prices = prices[summary[summary["Data Quality OK"]]["Ticker"].tolist()]
-window_mb = find_window_multibaggers(quality_ok_prices, window_years, MULTIBAGGER_X)
+# ---- Controls in main area, top ----
+st.subheader("🔧 What are you looking for?")
 
-if window_mb.empty:
-    st.info(f"No stocks reached 10×+ in any {window_years}-year window.")
+c1, c2, c3 = st.columns([1, 1, 2])
+
+with c1:
+    threshold_choice = st.select_slider(
+        "Minimum return",
+        options=[2, 3, 5, 10, 20, 50, 100],
+        value=10,
+        format_func=lambda x: f"{x}×",
+        help="Find stocks that gave AT LEAST this multiple."
+    )
+    THRESHOLD = float(threshold_choice)
+
+with c2:
+    window_choice = st.select_slider(
+        "Within a window of",
+        options=[0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        value=3,
+        format_func=lambda x: f"{x:g} year{'s' if x != 1 else ''}",
+        help="Length of the rolling window. e.g. '3 years' = stocks that 10×'d "
+             "in any 3-year period like 2017→2020 or 2021→2024."
+    )
+    WINDOW_YEARS = float(window_choice)
+
+with c3:
+    min_data_date = prices.index.min().date()
+    max_data_date = prices.index.max().date()
+    period_filter = st.date_input(
+        "Run must END between (optional period filter)",
+        value=(min_data_date, max_data_date),
+        min_value=min_data_date,
+        max_value=max_data_date,
+        help="To find 2017-2018 winners: set 2017-01-01 → 2018-12-31. "
+             "Leave full to scan everything."
+    )
+
+st.divider()
+
+# ---- Build quality mask + scan ----
+quality_ok = build_quality_mask(prices)
+quality_ok_tickers = quality_ok[quality_ok].index.tolist()
+quality_ok_prices  = prices[quality_ok_tickers]
+
+results = find_window_multibaggers(quality_ok_prices, WINDOW_YEARS, THRESHOLD)
+
+# Apply period filter
+if len(period_filter) == 2 and not results.empty:
+    period_start = pd.Timestamp(period_filter[0])
+    period_end   = pd.Timestamp(period_filter[1])
+    results = results[
+        (results["End Date"] >= period_start) &
+        (results["End Date"] <= period_end)
+    ].reset_index(drop=True)
+
+# Merge company names
+if not results.empty:
+    results = results.merge(meta[["Ticker", "Company"]], on="Ticker", how="left")
+
+# ---- Top metrics ----
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Stocks scanned", f"{len(quality_ok_tickers):,}")
+m2.metric(f"≥{THRESHOLD:.0f}× found", f"{len(results):,}")
+m3.metric(
+    "Best multiple",
+    f"{results['Best Multiple'].max():.1f}×" if not results.empty else "—",
+    results.iloc[0]["Ticker"] if not results.empty else None,
+)
+m4.metric(
+    "Median CAGR",
+    f"{results['Best CAGR'].median() * 100:.1f}%" if not results.empty else "—",
+)
+
+st.divider()
+
+# ---- Results ----
+if results.empty:
+    st.info(
+        f"No stocks gave ≥{THRESHOLD:.0f}× return in any "
+        f"{WINDOW_YEARS:g}-year window during the chosen period.\n\n"
+        "Try lowering the threshold, picking a different window length, "
+        "or widening the date range."
+    )
 else:
-    # Merge company names
-    window_mb = window_mb.merge(meta[["Ticker", "Company"]], on="Ticker", how="left")
-    window_mb = window_mb[["Ticker", "Company", "Best Multiple",
-                           "Best CAGR", "Best Start Date", "Best End Date"]]
+    st.subheader(
+        f"🎯 {len(results)} stocks gave ≥{THRESHOLD:.0f}× in a "
+        f"{WINDOW_YEARS:g}-year window"
+    )
 
-    # Summary metric
-    mc1, mc2 = st.columns(2)
-    mc1.metric(f"{window_years}-year multibaggers found", f"{len(window_mb):,}")
-    mc2.metric("Highest multiple",
-               f"{window_mb['Best Multiple'].iloc[0]:.1f}×",
-               window_mb["Ticker"].iloc[0])
-
-    # Top 30 bar chart
-    top_n = min(30, len(window_mb))
-    fig_w = px.bar(
-        window_mb.head(top_n),
+    # Bar chart of top N
+    top_n = min(30, len(results))
+    fig = px.bar(
+        results.head(top_n),
         x="Best Multiple", y="Ticker", orientation="h",
         hover_data={
-            "Company":         True,
-            "Best Multiple":   ":.2f",
-            "Best CAGR":       ":.1%",
-            "Best Start Date": "|%b %Y",
-            "Best End Date":   "|%b %Y",
+            "Company":       True,
+            "Best Multiple": ":.2f",
+            "Best CAGR":     ":.1%",
+            "Start Date":    "|%Y-%m-%d",
+            "End Date":      "|%Y-%m-%d",
         },
-        color="Best Multiple", color_continuous_scale="Viridis",
-        title=f"Top {top_n} {window_years}-year window multibaggers",
+        color="Best Multiple", color_continuous_scale="Greens",
+        title=f"Top {top_n} multibagger runs",
     )
-    fig_w.update_layout(height=max(400, 22 * top_n),
-                        yaxis={"categoryorder": "total ascending"},
-                        margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig_w, use_container_width=True)
+    fig.update_layout(
+        height=max(400, 22 * top_n),
+        yaxis={"categoryorder": "total ascending"},
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Full table for window multibaggers
-    st.write(f"**All {len(window_mb)} {window_years}-year multibaggers:**")
-    table_w = window_mb.copy()
-    table_w["Best CAGR (%)"] = (table_w["Best CAGR"] * 100).round(1)
-    table_w["Best Start Date"] = pd.to_datetime(table_w["Best Start Date"]).dt.strftime("%Y-%m-%d")
-    table_w["Best End Date"]   = pd.to_datetime(table_w["Best End Date"]).dt.strftime("%Y-%m-%d")
-    table_w = table_w[["Ticker", "Company", "Best Multiple", "Best CAGR (%)",
-                       "Best Start Date", "Best End Date"]]
-
+    # Full sortable table
+    st.write(f"**All {len(results)} results (sortable):**")
+    tbl = results.copy()
+    tbl["Best CAGR (%)"] = (tbl["Best CAGR"] * 100).round(1)
+    tbl["Start"] = pd.to_datetime(tbl["Start Date"]).dt.strftime("%Y-%m-%d")
+    tbl["End"]   = pd.to_datetime(tbl["End Date"]).dt.strftime("%Y-%m-%d")
+    tbl = tbl[["Ticker", "Company", "Best Multiple", "Best CAGR (%)", "Start", "End"]]
     st.dataframe(
-        table_w, use_container_width=True, height=400,
+        tbl, use_container_width=True, height=500,
         column_config={
-            "Best Multiple":   st.column_config.NumberColumn(format="%.2f×"),
-            "Best CAGR (%)":   st.column_config.NumberColumn(format="%.1f%%"),
+            "Best Multiple": st.column_config.NumberColumn(format="%.2f×"),
+            "Best CAGR (%)": st.column_config.NumberColumn(format="%.1f%%"),
         },
     )
 
     st.download_button(
-        f"📥 Download {window_years}-year window multibaggers as CSV",
-        data=window_mb.to_csv(index=False).encode(),
-        file_name=f"us_stocks_{window_years}y_window_multibaggers.csv",
+        "📥 Download results as CSV",
+        data=results.to_csv(index=False).encode(),
+        file_name=f"multibaggers_{int(THRESHOLD)}x_{WINDOW_YEARS:g}y.csv",
         mime="text/csv",
-        key="dl_window",
     )
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# FULL TABLE
+# PER-STOCK INSPECTOR
 # ---------------------------------------------------------------------------
-st.subheader("📊 All stocks — sortable")
+st.subheader("🔎 Inspect a specific stock")
 
-display = view.copy().sort_values("Multiple (x)", ascending=False)
-display["Median 1Y Return"] = (display["Median 1Y Return"] * 100).round(2)
-display["Median 3Y CAGR"]   = (display["Median 3Y CAGR"] * 100).round(2)
-display["Multibagger"]      = display["Multibagger"].map({True: "🚀", False: ""})
+inspect_tickers = sorted(quality_ok_tickers)
+default_idx = 0
+if not results.empty:
+    top_ticker = results.iloc[0]["Ticker"]
+    if top_ticker in inspect_tickers:
+        default_idx = inspect_tickers.index(top_ticker)
 
-# Drop internal columns from view
-display = display.drop(columns=["Data Quality OK", "Quality Issues"], errors="ignore")
-
-st.dataframe(
-    display.rename(columns={
-        "Median 1Y Return": "Median 1Y Return (%)",
-        "Median 3Y CAGR":   "Median 3Y CAGR (%)",
-    }),
-    use_container_width=True,
-    height=600,
-    column_config={
-        "Multiple (x)": st.column_config.NumberColumn(format="%.2f×"),
-        "First Price":  st.column_config.NumberColumn(format="$%.2f"),
-        "Last Price":   st.column_config.NumberColumn(format="$%.2f"),
-    },
+selected = st.selectbox(
+    "Pick a ticker", inspect_tickers, index=default_idx,
+    help="Shows the full 10-year price chart. Multibagger window is highlighted "
+         "if this stock qualifies under your current threshold/window settings."
 )
 
-st.download_button(
-    "📥 Download as CSV",
-    data=view.to_csv(index=False).encode(),
-    file_name="us_stocks_multibaggers.csv",
-    mime="text/csv",
-)
+if selected:
+    s = prices[selected].dropna()
+    s = s[s > 0]
+    company = meta.loc[meta["Ticker"] == selected, "Company"].iloc[0] \
+        if not meta[meta["Ticker"] == selected].empty else ""
+
+    fig_s = go.Figure()
+    fig_s.add_trace(go.Scatter(
+        x=s.index, y=s.values, mode="lines", name=selected,
+        line=dict(color="#1f77b4", width=1.5)
+    ))
+
+    if not results.empty:
+        stock_row = results[results["Ticker"] == selected]
+        if not stock_row.empty:
+            row = stock_row.iloc[0]
+            fig_s.add_vrect(
+                x0=row["Start Date"], x1=row["End Date"],
+                fillcolor="rgba(46, 204, 113, 0.20)", line_width=0,
+                annotation_text=(
+                    f"{row['Best Multiple']:.1f}× in "
+                    f"{WINDOW_YEARS:g}y · CAGR {row['Best CAGR']*100:.1f}%"
+                ),
+                annotation_position="top left",
+            )
+
+    fig_s.update_layout(
+        title=f"{selected} — {company}",
+        xaxis_title="Date", yaxis_title="Price (adj. close, log scale)",
+        yaxis_type="log",
+        height=500, margin=dict(l=10, r=10, t=50, b=10),
+    )
+    st.plotly_chart(fig_s, use_container_width=True)
